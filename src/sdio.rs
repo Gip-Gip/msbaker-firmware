@@ -17,7 +17,7 @@
 // Ms. Baker's firmware(in a file named LEGAL-SOFTWARE).
 // If not, see <https://www.gnu.org/licenses/>.
 
-// You will see many expanded 32 bit integers for use with reading and setting
+// You will see some expanded 32 bit integers for use with reading and setting
 // flags and registers
 //
 // Here are the bit positions for two word commands
@@ -38,7 +38,14 @@ use cortex_m::delay::Delay;
 use rp2040_hal as hal;
 use crate::errors::MsBakerError;
 
+/// Timeout for SD commands, in microseconds
 pub const SD_CMD_TIMEOUT_US: u32 = 1_000_000;
+
+/// OCR voltage range, set to 3.2-3.4
+pub const SD_OCR_VOLT_RANGE: u32 = 0b0011_0000__0000_0000_0000_0000;
+
+/// Block length for SD operations
+pub const SD_BLOCK_LEN: u32 = 512;
 
 /// CRC7 Table used for calculating all 7-bit sd-card crcs
 pub static CRC7_TABLE: [u8; 256] = [
@@ -93,43 +100,53 @@ pub fn calculate_crc7_from_words(words: &[u32], skip: usize, len: usize) -> u8 {
 }
 
 /// Possible commands to give to the SD card
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 pub enum SdCmd {
     /// CMD0: GO_IDLE_STATE, R0
     GoIdleState,
-    /// CMD2: ALL_SEND_CID, R2.
-    /// CMD3: SEND_RELATIVE_ADDR, R6.
-    /// CMD6: SWITCH_FUNC, R1
-    /// CMD7: SELECT_DESELECT_CARD, R1b.
+    /// CMD2: ALL_SEND_CID, requests all SD cards send their CIDs. R2.
+    AllSendCid,
+    /// CMD3: SEND_RELATIVE_ADDR, asks the card to send it's RCA. R6.
+    SendRelativeAddr,
+    // /// !TODO! CMD6: SWITCH_FUNC, R1
+    /// CMD7: SELECT_DESELECT_CARD, selects the card if the RCA is that of
+    /// the card, deselects it otherwise. Supply the RCA. R1b.
+    SelectDeselectCard(u16),
     /// CMD8: SEND_IF_COND, asks if the sd card supports the current voltage along if
-    /// it supports pcie. Supply the check pattern to be verified.
+    /// it supports pcie. Supply the check pattern to be verified. R7.
     SendIfCond(u8),
-    /// CMD9: SEND_CSD, R1.
-    /// CMD10: SEND_CID, R1.
-    /// CMD12: STOP_TRANSMISSION, R1b.
-    /// CMD13: SEND_STATUS, R2.
-    /// CMD16: SET_BLOCKLEN, R1.
-    /// CMD17: READ_SINGLE_BLOCK, R1.
-    /// CMD18: READ_MULTIPLE_BLOCK, R1.
-    /// CMD24: WRITE_BLOCK, R1.
-    /// CMD25: WRITE_MULTIPLE_BLOCK, R1.
-    /// CMD27: PROGRAM_CSD, R1.
-    /// CMD32: ERASE_WR_BLK_START, R1.
-    /// CMD33: ERASE_WR_BLK_END, R1.
-    /// CMD38: ERASE, R1b.
+    /// CMD9: SEND_CSD, asks the card to send it's csd. Supply the RCA
+    /// of the card. R2.
+    SendCsd(u16),
+    // /// !TODO! CMD10: SEND_CID, R1.
+    // /// !TODO! CMD12: STOP_TRANSMISSION, R1b.
+    // /// !TODO! CMD13: SEND_STATUS, R2.
+    /// CMD16: SET_BLOCKLEN, sets the block length to be used in all reads
+    /// and writes. Supply the block length as a u32. R1.
+    SetBlockLen(u32),
+    // /// !TODO! CMD17: READ_SINGLE_BLOCK, R1.
+    // /// !TODO! CMD18: READ_MULTIPLE_BLOCK, R1.
+    // /// !TODO! CMD24: WRITE_BLOCK, R1.
+    // /// !TODO! CMD25: WRITE_MULTIPLE_BLOCK, R1.
+    // /// !TODO! CMD27: PROGRAM_CSD, R1.
+    // /// !TODO! CMD32: ERASE_WR_BLK_START, R1.
+    // /// !TODO! CMD33: ERASE_WR_BLK_END, R1.
+    // /// !TODO! CMD38: ERASE, R1b.
     /// CMD55: APP_CMD, R1. **DO NOT USE.** APP_CMD is automatically sent before any ACMD.
     /// Supply the RCA with this command
     AppCmd(u16),
-    /// CMD56: GEN_CMD
-    /// ACMD6: SET_BUS_WIDTH
-    /// ACMD13: SD_STATUS
-    /// ACMD22: SEND_NUM_WR_BLOCKS
-    /// ACMD23: SET_WR_BLK_ERASE_COUNT
+    // /// !TODO! CMD56: GEN_CMD
+    /// ACMD6: SET_BUS_WIDTH, sets the bus width to 4-bit if the supplied boolean
+    /// is true, 1-bit if false. R1
+    SetBusWidth(bool),
+    // /// !TODO! ACMD13: SD_STATUS
+    // /// !TODO! ACMD22: SEND_NUM_WR_BLOCKS
+    // /// !TODO! ACMD23: SET_WR_BLK_ERASE_COUNT
     /// ACMD41: SD_APP_OP_COND, Sends host capacity support info and asks the card to send the OCR
     /// Supply HCS, XPC, S18R, and Voltage Window
     SdAppOpCond(bool, bool, bool, u32),
-    /// ACMD42: SET_CLR_CARD_DETECT
-    /// ACMD51: SEND_SCR
+    // /// !TODO! ACMD42: SET_CLR_CARD_DETECT
+    // /// !TODO! ACMD51: SEND_SCR
 }
 
 impl SdCmd {
@@ -137,9 +154,14 @@ impl SdCmd {
     pub fn get_cmd_index(&self) -> u8 {
         match self {
             SdCmd::GoIdleState => 0,
+            SdCmd::AllSendCid => 2,
+            SdCmd::SendRelativeAddr => 3,
+            SdCmd::SetBusWidth(_) => 6,
+            SdCmd::SelectDeselectCard(_) => 7,
             SdCmd::SendIfCond(_) => 8,
+            SdCmd::SendCsd(_) => 9,
+            SdCmd::SetBlockLen(_) => 16,
             SdCmd::SdAppOpCond(_, _, _, _) => 41,
-            SdCmd::SendScr => 51,
             SdCmd::AppCmd(_) => 55,
         }
     }
@@ -148,9 +170,14 @@ impl SdCmd {
     pub fn get_cmd_response(&self) -> SdCmdResponseType {
         match self {
             SdCmd::GoIdleState => SdCmdResponseType::R0,
-            SdCmd::SendScr |
+            SdCmd::SetBusWidth(_) |
+                SdCmd::SetBlockLen(_) |
                 SdCmd::AppCmd(_) => SdCmdResponseType::R1,
+            SdCmd::SelectDeselectCard(_) => SdCmdResponseType::R1b,
+            SdCmd::AllSendCid |
+                SdCmd::SendCsd(_) => SdCmdResponseType::R2,
             SdCmd::SdAppOpCond(_, _, _, _) => SdCmdResponseType::R3,
+            SdCmd::SendRelativeAddr => SdCmdResponseType::R6,
             SdCmd::SendIfCond(_) => SdCmdResponseType::R7,
         }
     }
@@ -159,9 +186,15 @@ impl SdCmd {
     pub fn is_acmd(&self) -> bool {
         match self {
             SdCmd::GoIdleState |
+                SdCmd::AllSendCid |
+                SdCmd::SendRelativeAddr |
+                SdCmd::SelectDeselectCard(_) |
                 SdCmd::SendIfCond(_) |
+                SdCmd::SendCsd(_) |
+                SdCmd::SetBlockLen(_) |
                 SdCmd::AppCmd(_) => false,
-            SdCmd::SdAppOpCond(_, _, _, _) => true,
+            SdCmd::SetBusWidth(_) |
+                SdCmd::SdAppOpCond(_, _, _, _) => true,
         }
     }
 
@@ -185,42 +218,56 @@ impl SdCmd {
 
         // Bits 47-16 is the argument
         match self {
+            Self::SetBlockLen(block_length) => {
+                data[0] |= (block_length >> 16) & 0xFFFF;
+                data[1] |= (block_length << 16) & 0xFFFF_0000;
+            }
+            Self::SetBusWidth(fourbit) => {
+                data[1] |= match fourbit {
+                    true => 0b10 << 16,
+                    false => 0,
+                }
+            }
             Self::SendIfCond(test_pattern) => {
                 // Bits 47-28 are reserved
                 // 27-24 is the supply voltage, however always 0b0001 (2.7-3.6v)
                 // both because that is the rp2040 voltage and because no other
                 // ranges are specified
-                data[1] |= 0b0000_0001_0000_0000__0000_0000_0000_0000;
+                data[1] |= (0b0001 << 24);
                 // 23-16 is the check pattern
                 data[1] |= (*test_pattern as u32) << 16;
             }
             Self::SdAppOpCond(hcs, xpc, s18r, voltage_window) => {
                 // Bit 47 is reserved
                 // Bit 46 is the HCS
-                if hcs {
-                    data[0] |= 0b0000_0000_0000_0000__0100_0000_0000_0000;
+                if *hcs {
+                    data[0] |= (1<<14);
                 }
                 // Bit 45 is reserved
                 // Bit 44 is XPC
-                if xpc {
-                    data[0] |= 0b0000_0000_0000_0000__0001_0000_0000_0000;
+                if *xpc {
+                    data[0] |= (1<<12);
                 }
                 // Bits 43-41 are reserved
                 // Bit 40 is S18R
-                if s18r {
-                    data[0] |= 0b0000_0000_0000_0000__0000_0001_0000_0000;
+                if *s18r {
+                    data[0] |= (1<<8);
                 }
 
                 // Bits 39-16 is the Voltage Window
-                data[0] |= (voltage_window >> 8) & 0xFF;
+                data[0] |= (voltage_window >> 16) & 0xFF;
                 data[1] |= (voltage_window << 16) & 0xFFFF_0000;
             }
-            Self::AppCmd(rca) => {
+            Self::SelectDeselectCard(rca)|
+                Self::SendCsd(rca) |
+                Self::AppCmd(rca) => {
                 // Bits 47-32 are the RCA, 31-16 are stuff bits
                 data[0] |= *rca as u32;
             }
             // And some commands don't have an argument
-            _ => {}
+            Self::GoIdleState |
+                Self::AllSendCid |
+                Self::SendRelativeAddr => {}
         }
 
         // Bits 15-9 is the crc7 of the command, processed in big endian
@@ -277,24 +324,192 @@ pub enum SdCmdResponse {
     /// R0, returns nothing
     R0,
     /// R1, returns the card status
-    R1,
+    R1(SdCardStatus),
     /// R1b, identical to R1
-    R1b,
+    R1b(SdCardStatus),
     /// R2, returns cid or csd
-    R2,
+    R2([u32; 4]),
     /// R3, returns OCR register
-    R3,
+    R3(SdOcr),
     /// R6, returns RCA
-    R6,
+    R6(u16),
     /// R7, returns CIC
     R7(SdCic),
 }
 
+/// Status of the sd card
+pub struct SdCardStatus {
+    pub card_status: u32,
+}
+
+impl SdCardStatus {
+    /// Gets the current state of the card
+    pub fn get_current_state(&self) -> SdCurrentState {
+        let current_state = (self.card_status >> 9) & 0xF;
+
+        SdCurrentState::from_int(current_state as u8)
+    }
+    /// Returns true if the OUT_OF_RANGE bit is set
+    pub fn out_of_range(&self) -> bool {
+        (self.card_status & (1<<31)) > 0
+    }
+    /// Returns true if the ADDRESS_ERROR bit is set
+    pub fn address_error(&self) -> bool {
+        (self.card_status & (1<<30)) > 0
+    }
+    /// Returns true if the BLOCK_LEN_ERROR bit is set
+    pub fn block_len_error(&self) -> bool {
+        (self.card_status & (1<<29)) > 0
+    }
+    /// Returns true if the ERASE_SEQ_ERROR bit is set
+    pub fn erase_seq_error(&self) -> bool {
+        (self.card_status & (1<<28)) > 0
+    }
+    /// Returns true if the ERASE_PARAM bit is set
+    pub fn erase_param(&self) -> bool {
+        (self.card_status & (1<<27)) > 0
+    }
+    /// Returns true if the WP_VIOLATION bit is set
+    pub fn wp_violation(&self) -> bool {
+        (self.card_status & (1<<26)) > 0
+    }
+    /// Returns true if the CARD_IS_LOCKED bit is set
+    pub fn card_is_locked(&self) -> bool {
+        (self.card_status & (1<<25)) > 0
+    }
+    /// Returns true if the LOCK_UNLOCK_FAILED bit is set
+    pub fn lock_unlocked_failed(&self) -> bool {
+        (self.card_status & (1<<24)) > 0
+    }
+    /// Returns true if the COM_CRC_ERROR bit is set
+    pub fn com_crc_error(&self) -> bool {
+        (self.card_status & (1<<23)) > 0
+    }
+    /// Returns true if the ILLEGAL_COMMAND bit is set
+    pub fn illegal_command(&self) -> bool {
+        (self.card_status & (1<<22)) > 0
+    }
+    /// Returns true if the CARD_ECC_FAILED bit is set
+    pub fn card_ecc_failed(&self) -> bool {
+        (self.card_status & (1<<21)) > 0
+    }
+    /// Returns true if the CC_ERROR bit is set
+    pub fn cc_error(&self) -> bool {
+        (self.card_status & (1<<20)) > 0
+    }
+    /// Returns true if the ERROR bit is set
+    pub fn error(&self) -> bool {
+        (self.card_status & (1<<19)) > 0
+    }
+    /// Returns true if the CSD_OVERWRITE bit is set
+    pub fn csd_overwrite(&self) -> bool {
+        (self.card_status & (1<<16)) > 0
+    }
+    /// Returns true if the WP_ERASE_SKIP bit is set
+    pub fn wp_erase_skip(&self) -> bool {
+        (self.card_status & (1<<15)) > 0
+    }
+    /// Returns true if the CARD_ECC_DISABLED bit is set
+    pub fn card_ecc_disabled(&self) -> bool {
+        (self.card_status & (1<<14)) > 0
+    }
+    /// Returns true if the ERASE_RESET bit is set
+    pub fn erase_reset(&self) -> bool {
+        (self.card_status & (1<<13)) > 0
+    }
+    /// Returns true if the READY_FOR_DATA bit is set
+    pub fn ready_for_data(&self) -> bool {
+        (self.card_status & (1<<8)) > 0
+    }
+    /// Returns true if the FX_EVENT bit is set
+    pub fn fx_event(&self) -> bool {
+        (self.card_status & (1<<6)) > 0
+    }
+    /// Returns true if the APP_CMD bit is set
+    pub fn app_cmd(&self) -> bool {
+        (self.card_status & (1<<5)) > 0
+    }
+    /// Returns true if the AKE_SEQ_ERROR bit is set
+    pub fn ake_seq_error(&self) -> bool {
+        (self.card_status & (1<<3)) > 0
+    }
+}
+
+pub enum SdCurrentState {
+    Idle,
+    Ready,
+    Ident,
+    Stby,
+    Tran,
+    Data,
+    Rcv,
+    Prg,
+    Dis,
+    Reserved,
+}
+
+impl SdCurrentState {
+    /// Grabs the sd state from a nibble
+    pub fn from_int(nibble: u8) -> Self {
+        match nibble {
+            0 => Self::Idle,
+            1 => Self::Ready,
+            2 => Self::Ident,
+            3 => Self::Stby,
+            4 => Self::Tran,
+            5 => Self::Data,
+            6 => Self::Rcv,
+            7 => Self::Prg,
+            8 => Self::Dis,
+            _ => Self::Reserved,
+        }
+    }
+}
+
+pub struct SdCid {
+    cid: [u32; 4],
+}
+
+pub struct SdCsd {
+    csd: [u32; 4],
+}
+
+pub struct SdOcr {
+    pub ocr: u32,
+}
+
+impl SdOcr {
+    /// Returns the voltage window
+    pub fn get_voltage_window(&self) -> u32 {
+        self.ocr & 0xFF_FFFF
+    }
+    /// Returns true if the card is busy
+    pub fn is_busy(&self) -> bool {
+        (self.ocr & (1<<31)) == 0
+    }
+    /// Returns true if the card supports switching to 1.8v
+    pub fn s18a(&self) -> bool {
+        (self.ocr & (1<<24)) > 0
+    }
+    /// Returns true if the card supports a capacity over 2 terabytes
+    pub fn co2t(&self) -> bool {
+        (self.ocr & (1<<27)) > 0
+    }
+    /// Returns true if the card supports UHS-II
+    pub fn uhs2(&self) -> bool {
+        (self.ocr & (1<<29)) > 0
+    }
+    /// Returns true if the CCS bit is set
+    pub fn ccs(&self) -> bool {
+        (self.ocr & (1<<30)) > 0
+    }
+}
+
 pub struct SdCic {
     /// Set to true if the card 
-    supports_1p2v: bool,
+    pub supports_1p2v: bool,
     /// Set to true if the card supports pcie
-    supports_pcie: bool,
+    pub supports_pcie: bool,
 }
 
 /// SDIO 4bit interface struct
@@ -311,6 +526,10 @@ pub struct Sdio4bit<P: PIOExt> {
     // sm_dat: StateMachine<(P, SM1), Running>,
     // sm_dat_rx: Rx<(P, SM1)>,
     // sm_dat_tx: Tx<(P, SM1)>,
+    
+    cid: SdCid,
+    rca: u16,
+    csd: SdCsd,
 }
 
 impl<P: PIOExt> Sdio4bit<P> {
@@ -347,6 +566,7 @@ impl<P: PIOExt> Sdio4bit<P> {
             .side_set_pin_base(sd_clk_id)
             .out_shift_direction(ShiftDirection::Left)
             .in_shift_direction(ShiftDirection::Left)
+            // Set the initial clock speed to ~1mhz for initialization
             .clock_divisor_fixed_point(25, 0)
             .autopush(true)
             .autopull(true)
@@ -362,30 +582,18 @@ impl<P: PIOExt> Sdio4bit<P> {
             sm_cmd,
             sm_cmd_rx,
             sm_cmd_tx,
+            cid: SdCid { cid: [0; 4] },
+            // RCA must initially be 0 for the first CMD55 to work properly
+            rca: 0,
+            csd: SdCsd { csd: [0; 4] },
         }
     }
 
-    /// Initialize the SD card
-    pub fn init(&mut self) -> Result<(), MsBakerError> {
-        // Wait 1ms to ensure that the card is properly initialized
-        self.delay.delay_ms(1);
-
-        // Send CMD0
-        self.send_command(SdCmd::GoIdleState)?;
-
-        // Send CMD8
-        let cic = match self.send_command(SdCmd::SendIfCond(0xAA))? {
-            SdCmdResponse::R7(cic) => cic,
-            _ => {panic!("INVALID RESPONSE TYPE(PE)");}
-        };
-
-        Ok(())
-    }
-
+    /// Send a command to the SD card
     pub fn send_command(&mut self, command: SdCmd) -> Result<SdCmdResponse, MsBakerError> {
         // If the command is an app command, first send the AppCmd command
         if command.is_acmd() {
-            self.send_command(SdCmd::AppCmd(0x0000));
+            self.send_command(SdCmd::AppCmd(self.rca))?;
         }
 
         // Get the data for the command
@@ -421,7 +629,6 @@ impl<P: PIOExt> Sdio4bit<P> {
             resp_buf[i] = self.sm_cmd_rx.read().unwrap();
         }
 
-        let crc = (resp_buf[1] & 0xFE) as u8;
         // shift the last word so the same crc calculation can be used for in
         // and out data
         resp_buf[resp_len - 1] = resp_buf[resp_len - 1] << (32 - (resp_len_bits % 32));
@@ -431,18 +638,77 @@ impl<P: PIOExt> Sdio4bit<P> {
             return Ok(SdCmdResponse::R0);
         }
 
-        // Verifty the crc
-        let good_crc = calculate_crc7_from_words(&resp_buf, 0, (resp_len_bits / 8) as usize );
+        // Verifty the command index and crc (if it has one)
+        if(response_type != SdCmdResponseType::R2 && response_type != SdCmdResponseType::R3) {
+            let good_command_index = command.get_cmd_index();
 
-        let crc = ((resp_buf[1] >> 16) & 0xFE) as u8;
+            let command_index = ((resp_buf[0]>> 24) & 0x3F) as u8;
 
-        if good_crc != crc {
-            return Err(MsBakerError::SdioBadCrc7{good_crc, bad_crc: crc});
+            if good_command_index != command_index {
+                return Err(MsBakerError::SdioWrongCmd {good_cmd: good_command_index, bad_cmd: command_index});
+            }
+
+            // All commands with a CRC are 48 bits, with the last 8 bits being the CRC7 + stop bit
+
+            // Calculate the CRC up to the CRC
+            let good_crc = calculate_crc7_from_words(&resp_buf, 0, 5);
+            
+            let crc = ((resp_buf[1] >> 16) & 0xFE) as u8;
+
+            if good_crc != crc {
+                return Err(MsBakerError::SdioBadCrc7{good_crc, bad_crc: crc});
+            }
         }
 
+        // Construct the response
         match response_type {
+            SdCmdResponseType::R1 => {
+                let card_status = ((resp_buf[0] & 0x00FF_FFFF) << 8) | ((resp_buf[1] & 0xFF00_0000) >> 24);
+
+                Ok(SdCmdResponse::R1(SdCardStatus {
+                    card_status
+                }))
+            }
+            SdCmdResponseType::R1b => {
+                let card_status = ((resp_buf[0] & 0x00FF_FFFF) << 8) | ((resp_buf[1] & 0xFF00_0000) >> 24);
+
+                Ok(SdCmdResponse::R1b(SdCardStatus {
+                    card_status
+                }))
+            }
+            SdCmdResponseType::R2 => {
+                let mut words: [u32; 4] = [0; 4];
+
+                // Shift all the data left 8 bits to remove the first 8 bits of
+                // the response
+                words[0] = ((resp_buf[0] & 0x00FF_FFFF) << 8) | ((resp_buf[1] & 0xFF00_0000) >> 24);
+                words[1] = ((resp_buf[1] & 0x00FF_FFFF) << 8) | ((resp_buf[2] & 0xFF00_0000) >> 24);
+                words[2] = ((resp_buf[2] & 0x00FF_FFFF) << 8) | ((resp_buf[3] & 0xFF00_0000) >> 24);
+                words[3] = ((resp_buf[3] & 0x00FF_FFFF) << 8) | ((resp_buf[4] & 0xFF00_0000) >> 24);
+
+                Ok(SdCmdResponse::R2(words))
+            }
+            SdCmdResponseType::R3 => {
+                let ocr = ((resp_buf[0] & 0x00FF_FFFF) << 8) | ((resp_buf[1] & 0xFF00_0000) >> 24);
+
+                Ok(SdCmdResponse::R3(SdOcr {
+                    ocr
+                }))
+            }
+            SdCmdResponseType::R6 => {
+                let rca: u16 = ((resp_buf[0] & 0x00FF_FF00) >> 8) as u16;
+
+                // You also get some status bits with this command, but I doubt
+                // there is a single scenario where it is useful to read them.
+                //
+                // Feel free to correct me though.
+                Ok(SdCmdResponse::R6(rca))
+            }
             SdCmdResponseType::R7 => {
-                if let SdCmd::SendIfCond(good_check_pattern) = command {
+                let good_check_pattern = match command {
+                    SdCmd::SendIfCond(check_pattern) => check_pattern,
+                    _ => {return Err(MsBakerError::PE {})}
+                };
                 // Bit 21 is the 1.2v support bit, 20 is the pcie support
                 //                                   4444 4444 3333 3333  3322 2222 2222 1111
                 //                                   7654 3210 9876 5432  1098 7654 3210 9876
@@ -468,15 +734,81 @@ impl<P: PIOExt> Sdio4bit<P> {
                     supports_1p2v,
                     supports_pcie,
                 }))
-                }
-                else {
-                    // Shouldn't happen, but just incase
-                    panic!("IMPROPER USE OF RESPONSE TYPE 7");
-                }
             }
-            _ => {
-                todo!()
-            }
+            SdCmdResponseType::R0 => {Err(MsBakerError::PE {})} // Shouldn't happen
         }
+    }
+
+    /// Initialize the SD card
+    pub fn init(&mut self) -> Result<(), MsBakerError> {
+        // Wait 1ms to ensure that the card is properly initialized
+        self.delay.delay_ms(1);
+
+        // Send CMD0
+        self.send_command(SdCmd::GoIdleState)?;
+
+        // Send CMD8
+        let cic = match self.send_command(SdCmd::SendIfCond(0xAA))? {
+            SdCmdResponse::R7(cic) => cic,
+            _ => {return Err(MsBakerError::PE {})}
+        };
+
+        // Send ACMD41 until the card is no longer busy, and once ready verify
+        // the voltage window is valid
+        let acmd41 = SdCmd::SdAppOpCond(true, true, false, SD_OCR_VOLT_RANGE);
+
+        let mut is_busy = true;
+        let mut ocr = SdOcr {ocr: 0};
+
+        while is_busy {
+            ocr = match self.send_command(acmd41)? {
+                SdCmdResponse::R3(ocr) => ocr,
+                _ => {return Err(MsBakerError::PE {})}
+            };
+
+            is_busy = ocr.is_busy();
+        }
+
+        if (ocr.get_voltage_window() & SD_OCR_VOLT_RANGE) != SD_OCR_VOLT_RANGE {
+            return Err(MsBakerError::SdioBadVoltRange{})
+        }
+
+        // Get the CID
+        let cid = match self.send_command(SdCmd::AllSendCid)? {
+            SdCmdResponse::R2(cid) => cid,
+            _ => {return Err(MsBakerError::PE {})}
+        };
+
+        self.cid = SdCid { cid };
+
+        // Get the RCA
+        let rca = match self.send_command(SdCmd::SendRelativeAddr)? {
+            SdCmdResponse::R6(rca) => rca,
+            _ => {return Err(MsBakerError::PE {})}
+        };
+
+        self.rca = rca;
+
+        // Get the CSD
+        let csd = match self.send_command(SdCmd::SendCsd(rca))? {
+            SdCmdResponse::R2(csd) => csd,
+            _ => {return Err(MsBakerError::PE {})}
+        };
+
+        self.csd = SdCsd { csd };
+
+        // Select the card
+        self.send_command(SdCmd::SelectDeselectCard(rca))?;
+
+        // Set the bus width to 4 bits(true means 4 bits)
+        self.send_command(SdCmd::SetBusWidth(true))?;
+
+        // Set the block lenth
+        self.send_command(SdCmd::SetBlockLen(SD_BLOCK_LEN))?;
+
+        // Speed up the clock to 25mhz and we're done!
+        self.sm_cmd.clock_divisor_fixed_point(1, 0);
+
+        Ok(())
     }
 }
