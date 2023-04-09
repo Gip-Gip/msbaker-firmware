@@ -36,7 +36,7 @@
 ;   pinctrl_in_base configuration, modulo 32.
 ; this is used as a wait index, and must be between 4 and 31.
 ; (offsets 0-3 are d0, d1, d2, and d3.)
-.define public sdio_clk_pin_d0_offset 30    ; (-2 in mod32 arithmetic)
+.define public sdio_clk_pin_d0_offset 31    ; (-1 in mod32 arithmetic)
 
 ; state machine 0 is used to:
 ; - generate continuous clock on sdio_clk
@@ -112,7 +112,6 @@ resp_done:
 .program sdio_data_rx
 
 wait_start:
-    mov x, y                               ; reinitialize number of nibbles to receive
     wait 0 pin 0                           ; wait for zero state on d0
     wait 1 pin sdio_clk_pin_d0_offset  [clkdiv-1]  ; wait for rising edge and then whole clock cycle
 

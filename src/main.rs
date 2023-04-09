@@ -30,6 +30,8 @@ use rp2040_hal as hal;
 use core::panic::PanicInfo;
 use hal::pac;
 
+use hal::dma::DMAExt;
+
 use hal::pio::PIOExt;
 use embedded_hal::blocking::i2c::WriteRead;
 use fugit::RateExtU32;
@@ -37,6 +39,9 @@ use fugit::RateExtU32;
 use embedded_hal::digital::v2::OutputPin;
 use rp2040_hal::clocks::Clock;
 use cortex_m::delay::Delay;
+
+use arrayvec::ArrayString;
+use core::fmt::Write;
 
 #[link_section = ".boot2"]
 #[used]
@@ -56,6 +61,7 @@ fn main_0() -> ! {
     // ===================================================================== //
     let mut pac = pac::Peripherals::take().unwrap();
     let core = pac::CorePeripherals::take().unwrap();
+    let dma = pac.DMA.split(&mut pac.RESETS);
 
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
 
@@ -107,24 +113,19 @@ fn main_0() -> ! {
     let pin_sd_clk_id = pin_sd_clk.id().num;
     let pin_sd_cmd_id = pin_sd_cmd.id().num;
     let pin_sd_dat0_id = pin_sd_dat0.id().num;
-    let pin_sd_dat1_id = pin_sd_dat1.id().num;
-    let pin_sd_dat2_id = pin_sd_dat2.id().num;
-    let pin_sd_dat3_id = pin_sd_dat3.id().num;
 
     // Initialize the sd card
     let (mut pio, sm0, sm1, _, _) = pac.PIO0.split(&mut pac.RESETS);
     let mut delay = Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
     let mut sd_controller = Sdio4bit::new(
         pio,
+        dma.ch0,
         delay,
         sm0,
         sm1,
         pin_sd_clk_id,
         pin_sd_cmd_id, 
         pin_sd_dat0_id,
-        pin_sd_dat1_id,
-        pin_sd_dat2_id,
-        pin_sd_dat3_id
     );
 
     sd_controller.init().unwrap();
@@ -152,10 +153,22 @@ fn main_0() -> ! {
     // ===================================================================== //
     // STEP 2, WAIT!                                                         //
     // ===================================================================== //
+    for i in 0..5 {
+        sd_controller.start_block_tx().unwrap();
+        match sd_controller.wait_tx() {
+            Ok(()) => {
+                break;
+            }
+            Err(e) => {
+                if i > 3 {
+                    panic!("{}", e);
+                }
+            }
+        }
+    }
 
     // Turn the LED solid to signify all is good!
     pin_led.set_high().unwrap();
-
     loop {
         cortex_m::asm::wfi();
     }
@@ -166,9 +179,38 @@ fn main_1() {
     todo!()
 }
 
+static xmorse: [u8; 256] = [
+    67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 12, 77, 78, 79, 80, 81, 82, 83, 84,
+    85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 0, 35, 65, 98, 99, 100,
+    66, 24, 58, 59, 101, 102, 17, 36, 15, 103, 104, 64, 105, 106, 107, 108,
+    109, 110, 111, 112, 62, 33, 113, 114, 115, 32, 116, 30, 37, 48, 50, 42, 44,
+    40, 27, 28, 63, 45, 41, 39, 46, 34, 43, 53, 49, 38, 29, 60, 61, 31, 117,
+    51, 118, 52, 119, 54, 120, 121, 122, 4, 23, 20, 11, 1, 19, 21, 7, 8, 56,
+    26, 10, 14, 6, 3, 22, 55, 9, 5, 2, 13, 25, 18, 47, 16, 57, 123, 124, 125,
+    126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140,
+    141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+    156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170,
+    171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185,
+    186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200,
+    201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215,
+    216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230,
+    231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245,
+    246, 247, 248, 249, 250, 251, 252, 253, 254, 255
+];
+
 #[panic_handler]
-fn panic(_: &PanicInfo) -> ! {
+fn panic(panic_info: &PanicInfo) -> ! {
     unsafe {
+
+        let mut message_string = ArrayString::<256>::new();
+
+        write!(&mut message_string, "{}", panic_info);
+
+        // Cut off the excess panic info at the start of the string to reduce
+        // decode time
+        let split_index = &message_string.find("`Err`").unwrap();
+
+        let message = &message_string[*split_index..];
 
         let mut pac = pac::Peripherals::steal();
         let core = pac::CorePeripherals::steal();
@@ -203,10 +245,40 @@ fn panic(_: &PanicInfo) -> ! {
         let mut delay = Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
         loop {
-            pin_led.set_high();
+
+            // Flash it at 4hz
+            for _ in 0 .. 4*10 {
+                pin_led.set_high();
+                delay.delay_ms(125);
+                pin_led.set_low();
+                delay.delay_ms(125);
+            }
+
             delay.delay_ms(1000);
-            pin_led.set_low();
-            delay.delay_ms(1000);
+            for byte in message.as_bytes() {
+                let mut byte: u8 = xmorse[*byte as usize];
+                // Flash quick twice to indicate new byte
+                pin_led.set_high();
+                delay.delay_ms(125);
+                pin_led.set_low();
+                delay.delay_ms(125);
+                pin_led.set_high();
+                delay.delay_ms(125);
+                pin_led.set_low();
+                delay.delay_ms(1000);
+
+                while byte > 0 {
+                    let delaytime = match (byte & 1) > 0 {
+                        true => 250,
+                        false => 1000,
+                    };
+                    pin_led.set_high();
+                    delay.delay_ms(delaytime);
+                    pin_led.set_low();
+                    delay.delay_ms(1000);
+                    byte >>= 1;
+                }
+            }
         }
     }
 }
