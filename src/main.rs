@@ -153,22 +153,14 @@ fn main_0() -> ! {
     // ===================================================================== //
     // STEP 2, WAIT!                                                         //
     // ===================================================================== //
-    for i in 0..5 {
-        sd_controller.start_block_tx().unwrap();
-        match sd_controller.wait_tx() {
-            Ok(()) => {
-                break;
-            }
-            Err(e) => {
-                if i > 3 {
-                    panic!("{}", e);
-                }
-            }
-        }
-    }
-
+    //sd_controller.start_block_tx().unwrap();
+    //sd_controller.wait_tx().unwrap();
     // Turn the LED solid to signify all is good!
+    
+    assert_eq!(sd_controller.working_block.unwrap()[0], 0xFFFF_FFFF);
+
     pin_led.set_high().unwrap();
+
     loop {
         cortex_m::asm::wfi();
     }
@@ -206,11 +198,7 @@ fn panic(panic_info: &PanicInfo) -> ! {
 
         write!(&mut message_string, "{}", panic_info);
 
-        // Cut off the excess panic info at the start of the string to reduce
-        // decode time
-        let split_index = &message_string.find("`Err`").unwrap();
-
-        let message = &message_string[*split_index..];
+        let message = &message_string;
 
         let mut pac = pac::Peripherals::steal();
         let core = pac::CorePeripherals::steal();
@@ -269,13 +257,13 @@ fn panic(panic_info: &PanicInfo) -> ! {
 
                 while byte > 0 {
                     let delaytime = match (byte & 1) > 0 {
-                        true => 250,
-                        false => 1000,
+                        true => 125,
+                        false => 500,
                     };
                     pin_led.set_high();
                     delay.delay_ms(delaytime);
                     pin_led.set_low();
-                    delay.delay_ms(1000);
+                    delay.delay_ms(1000-delaytime);
                     byte >>= 1;
                 }
             }
