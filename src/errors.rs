@@ -14,6 +14,8 @@ pub enum MsBakerError {
     SdioBadRxCrc7 {},
     #[snafu(display("(SDIO) Bad tx CRC7!"))]
     SdioBadTxCrc7 {},
+    #[snafu(display("(SDIO) Bad rx CRC16!"))]
+    SdioBadRxCrc16 { good_crc: u64, bad_crc: u64},
     #[snafu(display("(SDIO) Bad tx CRC16!"))]
     SdioBadTxCrc16 {},
     #[snafu(display("(SDIO) Bad CMD8 check pattern!"))]

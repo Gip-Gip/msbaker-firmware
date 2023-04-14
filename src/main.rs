@@ -153,11 +153,7 @@ fn main_0() -> ! {
     // ===================================================================== //
     // STEP 2, WAIT!                                                         //
     // ===================================================================== //
-    //sd_controller.start_block_tx().unwrap();
-    //sd_controller.wait_tx().unwrap();
     // Turn the LED solid to signify all is good!
-    
-    assert_eq!(sd_controller.working_block.unwrap()[0], 0xFFFF_FFFF);
 
     pin_led.set_high().unwrap();
 

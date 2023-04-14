@@ -42,6 +42,8 @@ use cortex_m::delay::Delay;
 use cortex_m::singleton;
 use rp2040_hal as hal;
 use core::mem;
+use rs_rws::{Read, Write};
+use rs_rws::Error as IoError;
 use crate::errors::MsBakerError;
 
 /// Timeout for SD commands, in microseconds
@@ -50,11 +52,33 @@ pub const SD_CMD_TIMEOUT_US: u32 = 1_000_000;
 /// OCR voltage range, set to 3.2-3.4
 pub const SD_OCR_VOLT_RANGE: u32 = 0b0011_0000__0000_0000_0000_0000;
 
-/// Block length for SD operations in words
-pub const SD_BLOCK_LEN: usize = 512 / 4;
+/// Block length for SD operations
+pub const SD_BLOCK_LEN: usize = 512;
 
 /// Size of the quaduple-crc at the end of a block
-pub const SD_BLOCK_CRC_LEN: usize = 8 / 4;
+pub const SD_BLOCK_CRC_LEN: usize = 8;
+
+/// Size of the end signal at the end of tx transmissions
+
+pub const SD_BLOCK_END_LEN: usize = 4;
+
+/// Size of all tx/rx transfers
+
+pub const SD_BLOCK_LEN_TOTAL: usize = SD_BLOCK_LEN + SD_BLOCK_CRC_LEN + SD_BLOCK_END_LEN;
+
+/// Multiplier for nibbles
+
+pub const SD_NIBBLE_MULT: usize = 2;
+
+
+/// Divider for words
+
+pub const SD_WORD_DIV: usize = 4;
+
+/// Index of the crc in the working block
+
+pub const SD_CRC_IDX_MSB: usize = SD_BLOCK_LEN / SD_WORD_DIV;
+pub const SD_CRC_IDX_LSB: usize = SD_CRC_IDX_MSB + 1;
 
 /// Clock speed divider for full speed transfers
 pub const SD_CLK_DIV_FULL: u16 = 25;
@@ -669,9 +693,9 @@ pub struct Sdio4bit<DMA_CH: SingleChannelDma, P: PIOExt> {
     csd: SdCsd,
 
     /// The current working block for the SD card
-    pub working_block: Option<&'static mut [u32; SD_BLOCK_LEN + SD_BLOCK_CRC_LEN + 1]>,
+    working_block: Option<&'static mut [u32; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV]>,
     /// The address of the current working block
-    working_block_num: u32,
+    pub working_block_num: u32,
     /// The current read/write position
     position: usize,
 
@@ -680,8 +704,8 @@ pub struct Sdio4bit<DMA_CH: SingleChannelDma, P: PIOExt> {
     sm_dat_tx: Option<Tx<(P, SM1)>>,
 
     /// Home for DMA and running state machine during TX and RX
-    tx_dma_in_use: Option<Transfer<DMA_CH, &'static mut [u32; SD_BLOCK_LEN + SD_BLOCK_CRC_LEN + 1], Tx<(P, SM1)>>>,
-    rx_dma_in_use: Option<Transfer<DMA_CH, Rx<(P, SM1)>, &'static mut [u32; SD_BLOCK_LEN + SD_BLOCK_CRC_LEN + 1]>>,
+    tx_dma_in_use: Option<Transfer<DMA_CH, &'static mut [u32; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV], Tx<(P, SM1)>>>,
+    rx_dma_in_use: Option<Transfer<DMA_CH, Rx<(P, SM1)>, &'static mut [u32; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV]>>,
     sm_in_use: Option<StateMachine<(P, SM1), Running>>,
 }
 
@@ -723,7 +747,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
             .autopull(true)
             .build(sm0);
         
-        let mut working_block = singleton!(: [u32; SD_BLOCK_LEN + SD_BLOCK_CRC_LEN + 1] = [0xAF; SD_BLOCK_LEN + SD_BLOCK_CRC_LEN + 1]).unwrap();
+        let mut working_block = singleton!(: [u32; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV] = [0xAF; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV]).unwrap();
 
 
         sm_cmd.set_pindirs([(sd_clk_id, PinDir::Output), (sd_cmd_id, PinDir::Output)]);
@@ -835,18 +859,19 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         // Construct the response
         match response_type {
             SdCmdResponseType::R1 => {
-                let card_status = ((resp_buf[0] & 0x00FF_FFFF) << 8) | ((resp_buf[1] & 0xFF00_0000) >> 24);
+                let card_status = SdCardStatus { card_status: ((resp_buf[0] & 0x00FF_FFFF) << 8) | ((resp_buf[1] & 0xFF00_0000) >> 24) };
 
-                Ok(SdCmdResponse::R1(SdCardStatus {
-                    card_status
-                }))
+                // Make sure we didn't get any errors
+                card_status.get_worst_error()?;
+
+                Ok(SdCmdResponse::R1(card_status))
             }
             SdCmdResponseType::R1b => {
-                let card_status = ((resp_buf[0] & 0x00FF_FFFF) << 8) | ((resp_buf[1] & 0xFF00_0000) >> 24);
+                let card_status = SdCardStatus { card_status: ((resp_buf[0] & 0x00FF_FFFF) << 8) | ((resp_buf[1] & 0xFF00_0000) >> 24) };
 
-                Ok(SdCmdResponse::R1b(SdCardStatus {
-                    card_status
-                }))
+                card_status.get_worst_error()?;
+
+                Ok(SdCmdResponse::R1b(card_status))
             }
             SdCmdResponseType::R2 => {
                 let mut words: [u32; 4] = [0; 4];
@@ -931,12 +956,14 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
 
         
         // Calculate the crc of the block and place it at the end of the block
-        let crc = crc16_4bit(&working_block[..SD_BLOCK_LEN]);
+        let crc = crc16_4bit(&working_block[..SD_BLOCK_LEN / SD_WORD_DIV]);
         
         let len = working_block.len();
 
-        working_block[len - 2] = (crc & 0xFFFF_FFFF) as u32;
-        working_block[len - 3] = ((crc >> 32) & 0xFFFF_FFFF) as u32;
+        working_block[SD_CRC_IDX_LSB] = (crc & 0xFFFF_FFFF) as u32;
+        working_block[SD_CRC_IDX_MSB] = ((crc >> 32) & 0xFFFF_FFFF) as u32;
+
+        // Place the transimssion end signal at the end of the block
         working_block[len - 1] = 0xFFFF_FFFF;
 
         // Now initialize the state machine with the TX program
@@ -952,7 +979,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
             .build(sm_dat);
 
         // Manually store the nibble count and response bit count to X an Y
-        sm_dat_tx.write(1048);
+        sm_dat_tx.write((SD_BLOCK_LEN_TOTAL * SD_NIBBLE_MULT) as u32);
         sm_dat.exec_instruction(Instruction {
             operands: InstructionOperands::OUT{
                 destination: OutDestination::X,
@@ -1086,9 +1113,8 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         let sm_dat_rx = mem::take(&mut self.sm_dat_rx).unwrap();
         let (sm_dat, program_data_tx) = mem::take(&mut self.sm_in_use).unwrap().uninit(sm_dat_rx, sm_dat_tx);
 
-        // Uninstall the program to free up space
-        self.program_data_tx = Some(program_data_tx);
         // Replace the appropriate borrowed variables
+        self.program_data_tx = Some(program_data_tx);
         self.dma = Some(dma);
         self.working_block = Some(working_block);
         self.sm_dat = Some(sm_dat);
@@ -1142,7 +1168,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
             .build(sm_dat);
 
         // Manually store the nibble count to X
-        sm_dat_tx.write((working_block.len() * 8) as u32);
+        sm_dat_tx.write((SD_BLOCK_LEN_TOTAL * SD_NIBBLE_MULT) as u32);
         sm_dat.exec_instruction(Instruction {
             operands: InstructionOperands::OUT{
                 destination: OutDestination::X,
@@ -1153,7 +1179,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         });
         
         // Initialize the pins and output to high (not setting the pins to high
-        // can cause instablility in testing...)
+        // can cause errors in testing...)
         sm_dat.exec_instruction(Instruction {
             operands: InstructionOperands::SET{
                 destination: SetDestination::PINS,
@@ -1215,7 +1241,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         if self.is_rx() {
             return Ok(true)
         }
-
+        
         // Put away everything we used
         // Deconstruct the DMA
         let (dma, sm_dat_rx, working_block) = mem::take(&mut self.rx_dma_in_use).unwrap().wait();
@@ -1224,12 +1250,22 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         let sm_dat_tx = mem::take(&mut self.sm_dat_tx).unwrap();
         let (sm_dat, program_data_rx) = mem::take(&mut self.sm_in_use).unwrap().uninit(sm_dat_rx, sm_dat_tx);
 
-        // Uninstall the program to free up space
-        self.program_data_rx = Some(program_data_rx);
+        // Save the CRC for later
+
+        let crc: u64 = (working_block[SD_CRC_IDX_LSB] as u64) | ((working_block[SD_CRC_IDX_MSB] as u64) << 32);
+        let good_crc = crc16_4bit(&working_block[..SD_BLOCK_LEN / SD_WORD_DIV]);
+
         // Replace the appropriate borrowed variables
+        self.program_data_rx = Some(program_data_rx);
         self.dma = Some(dma);
         self.working_block = Some(working_block);
         self.sm_dat = Some(sm_dat);
+
+        // Check the crc and if it's bad, error out!
+        
+        if crc != good_crc {
+            return Err(MsBakerError::SdioBadRxCrc16 {good_crc, bad_crc: crc});
+        }
 
         // Return false since we are no longer transferring!
         Ok(false)
@@ -1239,10 +1275,6 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         while self.poll_rx()? {}
 
         Ok(())
-    }
-
-    pub fn read(&mut self, buffer: &mut [u8]) -> Result<usize, MsBakerError> {
-        todo!()
     }
 
     /// Initialize the SD card
@@ -1310,7 +1342,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         self.send_command(SdCmd::SetBusWidth(true))?;
 
         // Set the block lenth
-        self.send_command(SdCmd::SetBlockLen((SD_BLOCK_LEN * 4) as u32))?;
+        self.send_command(SdCmd::SetBlockLen(SD_BLOCK_LEN as u32))?;
 
         // Speed up the clock to 25mhz
         self.sm_cmd.clock_divisor_fixed_point(SD_CLK_DIV_FULL, 0);
@@ -1319,5 +1351,30 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         self.start_block_rx()?;
         self.wait_rx()?;
         Ok(())
+    }
+}
+
+
+impl<DMA_CH: SingleChannelDma, P: PIOExt> Read for Sdio4bit<DMA_CH, P> {
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, IoError> {
+        todo!()
+    }
+
+    fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), IoError> {
+        todo!()
+    }
+}
+
+impl<DMA_CH: SingleChannelDma, P: PIOExt> Write for Sdio4bit<DMA_CH, P> {
+    fn write(&mut self, buffer: &[u8]) -> Result<usize, IoError> {
+        todo!()
+    }
+
+    fn write_all(&mut self, buffer: &[u8]) -> Result<(), IoError> {
+        todo!()
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        todo!()
     }
 }

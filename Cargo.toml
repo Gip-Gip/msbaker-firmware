@@ -1,5 +1,5 @@
 [package]
-name = "msbaker"
+name = "msbaker-firmware"
 version = "0.1.0"
 edition = "2021"
 
@@ -19,6 +19,7 @@ pio-proc = "0.2.0"
 pio = "0.2.0"
 snafu = { version = "0.7.4", default-features = false }
 arrayvec = { version = "0.7.2", default-features = false }
+rs-rws = { path="../rs-rws/" }
 
 [features]
 rt = ["rp2040-pac/rt"]
@@ -27,4 +28,3 @@ disable-intrinsics = []
 rom-v2-intrinsics = []
 rp2040-e5 = []
 critical-section-impl = ["critical-section/restore-state-u8"]
-
