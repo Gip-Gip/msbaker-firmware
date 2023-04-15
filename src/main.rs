@@ -41,7 +41,10 @@ use rp2040_hal::clocks::Clock;
 use cortex_m::delay::Delay;
 
 use arrayvec::ArrayString;
-use core::fmt::Write;
+use core::fmt::{Write as FmtWrite};
+
+use embedded_io::blocking::{Write, Seek};
+use embedded_io::SeekFrom;
 
 #[link_section = ".boot2"]
 #[used]
@@ -154,6 +157,20 @@ fn main_0() -> ! {
     // STEP 2, WAIT!                                                         //
     // ===================================================================== //
     // Turn the LED solid to signify all is good!
+
+    let clear:[u8; 256] = [0xFF; 256];
+
+    sd_controller.write_all(&clear).unwrap();
+
+    sd_controller.seek(SeekFrom::Start(0));
+
+    let hello = "Hi ".as_bytes();
+
+    for _ in 0..256 {
+        sd_controller.write_all(&hello).unwrap();
+    }
+
+    sd_controller.flush().unwrap();
 
     pin_led.set_high().unwrap();
 

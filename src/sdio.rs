@@ -32,6 +32,9 @@
 //  1098 7654 3210 9876  5432 1098 7654 3210
 //  XXXX_XXXX_XXXX_XXXX__XXXX_XXXX_XXXX_XXXX
 
+use embedded_io::blocking::{Read, Write, Seek, ReadExactError, WriteFmtError};
+use embedded_io::Error as IoError;
+use embedded_io::{Io, SeekFrom};
 use hal::pio::{MovStatusConfig, PinDir, ShiftDirection, PIOExt, PIO, PIOBuilder, SM0, SM1, StateMachine, UninitStateMachine, InstalledProgram, Running, Rx, Tx};
 use hal::dma::SingleChannel as SingleChannelDma;
 use hal::dma::single_buffer;
@@ -41,9 +44,8 @@ use pio::{Instruction, InstructionOperands, OutDestination, SetDestination, Prog
 use cortex_m::delay::Delay;
 use cortex_m::singleton;
 use rp2040_hal as hal;
-use core::mem;
-use rs_rws::{Read, Write};
-use rs_rws::Error as IoError;
+use core::{mem, cmp};
+use core::fmt::Arguments;
 use crate::errors::MsBakerError;
 
 /// Timeout for SD commands, in microseconds
@@ -695,9 +697,11 @@ pub struct Sdio4bit<DMA_CH: SingleChannelDma, P: PIOExt> {
     /// The current working block for the SD card
     working_block: Option<&'static mut [u32; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV]>,
     /// The address of the current working block
-    pub working_block_num: u32,
+    working_block_num: u32,
     /// The current read/write position
-    position: usize,
+    position: u64,
+    /// The size of the sd card in blocks
+    size: u32,
 
     /// Temporary home for Rx and Tx not used by DMAs
     sm_dat_rx: Option<Rx<(P, SM1)>>,
@@ -775,6 +779,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
             working_block: Some(working_block),
             working_block_num: 0,
             position: 0,
+            size: 0,
 
             // All start as none
             sm_dat_rx: None,
@@ -1072,20 +1077,25 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         }
     }
 
-    /// Check to see if the tx dma is busy
+    /// Returns true if you need to poll the tx
     pub fn is_tx(&self) -> bool {
         match &self.tx_dma_in_use {
-            Some(tx_dma) => {
-                !tx_dma.is_done()
-            },
+            Some(tx_dma) => true,
             None => false,
         }
     }
 
     /// Poll the current transfer, return true if still transferring
     pub fn poll_tx(&mut self) -> Result<bool, MsBakerError> {
-        // First, return if the transfer isn't done
-        if self.is_tx() {
+        // Return false if we don't need to poll tx, true if the DMA is still transferring
+        let ready = match &self.tx_dma_in_use {
+            Some(tx_dma) => tx_dma.is_done(),
+            None => {
+                return Ok(false)
+            },
+        };
+
+        if !ready {
             return Ok(true)
         }
 
@@ -1226,19 +1236,26 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         Ok(())
     }
 
-    /// Check to see if the rx dma is busy
+    /// Return true if you need to poll rx
     pub fn is_rx(&self) -> bool {
         match &self.rx_dma_in_use {
             Some(rx_dma) => {
-                !rx_dma.is_done()
+                true
             },
             None => false,
         }
     }
     /// Poll the current transfer, return true if still transferring
     pub fn poll_rx(&mut self) -> Result<bool, MsBakerError> {
-        // First, return if the transfer isn't done
-        if self.is_rx() {
+        // Return false if we don't need to poll rx, true if the DMA is still transferring
+        let ready = match &self.rx_dma_in_use {
+            Some(tx_dma) => tx_dma.is_done(),
+            None => {
+                return Ok(false)
+            },
+        };
+
+        if !ready {
             return Ok(true)
         }
         
@@ -1273,6 +1290,33 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
 
     pub fn wait_rx(&mut self) -> Result<(), MsBakerError> {
         while self.poll_rx()? {}
+
+        Ok(())
+    }
+
+    /// Returns true if you need to poll rx or tx
+    pub fn is_rx_tx(&self) -> bool {
+        self.is_rx() | self.is_tx()
+    }
+
+    /// Polls both RX and TX, when we don't know which one needs to be polled
+    pub fn poll_rx_tx(&mut self) -> Result<bool, MsBakerError> {
+        // If the tx dma or rx dma is Some, call the appropriate poll function
+        if let Some(_) = self.tx_dma_in_use {
+            return self.poll_tx()
+        }
+
+        if let Some(_) = self.rx_dma_in_use {
+            return self.poll_rx()
+        }
+
+        // Otherwise, neither are in use
+        Ok(false)
+    }
+
+    /// Waits until the card is neither recieving nor transferring data
+    pub fn wait_rx_tx(&mut self) -> Result<(), MsBakerError> {
+        while self.poll_rx_tx()? {}
 
         Ok(())
     }
@@ -1354,27 +1398,190 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
     }
 }
 
+impl<DMA_CH: SingleChannelDma, P: PIOExt> Io for Sdio4bit<DMA_CH, P> {
+    type Error = MsBakerError;
+}
 
 impl<DMA_CH: SingleChannelDma, P: PIOExt> Read for Sdio4bit<DMA_CH, P> {
-    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, IoError> {
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, MsBakerError> {
+        // Wait until we are doing nothing
+        self.wait_rx_tx()?;
         todo!()
     }
 
-    fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), IoError> {
+    fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), ReadExactError<MsBakerError>> {
         todo!()
     }
 }
 
 impl<DMA_CH: SingleChannelDma, P: PIOExt> Write for Sdio4bit<DMA_CH, P> {
-    fn write(&mut self, buffer: &[u8]) -> Result<usize, IoError> {
-        todo!()
+    /// Write bytes to the sd card. The PIO requires bytes to be converted to
+    /// little endian words, so there is a lot of conversion that needs to take
+    /// place...
+    /// Will return when the end of the block is encountered so be mindful...
+    fn write(&mut self, buffer: &[u8]) -> Result<usize, MsBakerError> {
+        // Wait until we are doing nothing
+        self.wait_rx_tx()?;
+
+        // If the position isn't in the current working block, flush,
+        // then load the correct working block
+        let current_block_num = (self.position / (SD_BLOCK_LEN as u64)) as u32;
+
+        if current_block_num != self.working_block_num {
+            self.flush()?;
+
+            self.working_block_num = current_block_num;
+            self.start_block_rx()?;
+            self.wait_rx()?;
+        }
+
+        let mut working_block = &mut self.working_block.as_mut().unwrap();
+
+        // Ensure buffer_index and self.position are incremented at
+        // the same time
+        let mut buffer_index: usize = 0;
+        let mut block_index: usize = ((self.position % (SD_BLOCK_LEN as u64)) as usize) / SD_WORD_DIV;
+
+        // First write all the bytes that don't align with words
+        let offset = (self.position % (SD_WORD_DIV as u64)) as usize;
+        let mut shift = 24 - (8 * offset) as usize;
+        let remaining = cmp::min(buffer.len() + offset, 4);
+
+        // If the bytes aren't aligned
+        if shift != 24 {
+            // Prepare a buffer word identical to the working block
+            // Mask A keeps all bytes before the data intact, mask b keeps
+            // all bytes after the data intact(if the length is 3 or under)
+            let mask_a = 0xFFFF_FFFF << (shift + 8);
+            let mask_b = (0xFFFF_FFFF >> ((8 * remaining) - 1) >> 1);
+            let mut buffer_word: u32 = working_block[block_index] & (mask_a | mask_b); 
+
+            while shift > 0 && buffer.len() > buffer_index{
+                buffer_word |= (buffer[buffer_index] as u32) << shift;
+
+                shift -= 8;
+                buffer_index += 1;
+                self.position += 1;
+            }
+
+            if buffer.len() > buffer_index {
+                buffer_word |= buffer[buffer_index] as u32;
+                buffer_index += 1;
+                self.position += 1;
+            }
+           
+            // Write the buffer word to the working block
+            working_block[block_index] = buffer_word;
+            block_index += 1;
+        }
+
+        // Now that the bytes are aligned, time to convert them all into words
+        // (until we can't)
+        while (buffer.len() - buffer_index) >= SD_WORD_DIV {
+            // Check if the position is now outside of the working block,
+            // and if so return with bytes written
+            if block_index >= (SD_BLOCK_LEN / SD_WORD_DIV) {
+                return Ok(buffer_index)
+            }
+
+            let buffer_slice = &buffer[buffer_index..buffer_index + SD_WORD_DIV];
+            let buffer_word = u32::from_be_bytes(buffer_slice.try_into().unwrap());
+
+            // Write the buffer word to the working block
+            working_block[block_index] = buffer_word;
+
+            // Increment the indicies
+            buffer_index += SD_WORD_DIV as usize;
+            self.position += SD_WORD_DIV as u64;
+            block_index += 1;
+        }
+        
+        // Lastly write all the bytes that don't align with words(again)
+        let remaining = buffer.len() - buffer_index;
+
+        // If the bytes aren't aligned...
+        if remaining > 0 {
+            // Check if the position is now outside of the working block,
+            // and if so return with bytes written
+            if block_index >= (SD_BLOCK_LEN / SD_WORD_DIV) {
+                return Ok(buffer_index)
+            }
+            
+            let mut shift: usize = 24;
+
+            // Prepare a buffer word
+            // The mask preserves all bytes after the data to be written
+            let mask: u32 = (0xFFFF_FFFF >> (8 * remaining));
+            let mut buffer_word: u32 = working_block[block_index] & mask;
+
+            while buffer_index < buffer.len() {
+                buffer_word |= (buffer[buffer_index] as u32) << shift;
+
+                shift -= 8;
+                buffer_index += 1;
+                self.position += 1;
+            }
+           
+            // Write the buffer word to the working block
+            working_block[block_index] = buffer_word;
+        }
+
+        Ok(buffer_index)
     }
 
-    fn write_all(&mut self, buffer: &[u8]) -> Result<(), IoError> {
-        todo!()
+    fn flush(&mut self) -> Result<(), MsBakerError> {
+        // If already in tx, we don't need to flush
+        if self.is_tx() {
+            self.wait_tx()?;
+            return Ok(())
+        }
+
+        // Otherwise wait for the recieve to be finished
+        self.wait_rx()?;
+
+        self.start_block_tx()?;
+        self.wait_tx()?;
+
+        Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), IoError> {
+    fn write_all(&mut self, buffer: &[u8]) -> Result<(), MsBakerError> {
+        let mut total = 0;
+
+        while total < buffer.len() {
+            total += self.write(&buffer[total..])?;
+        }
+
+        Ok(())
+    }
+
+    fn write_fmt(&mut self, fmt: Arguments<'_>) -> Result<(), WriteFmtError<MsBakerError>> {
         todo!()
+    }
+}
+
+impl<DMA_CH: SingleChannelDma, P: PIOExt> Seek for Sdio4bit<DMA_CH, P> {
+    fn seek(&mut self, position: SeekFrom) -> Result<u64, MsBakerError> {
+        Ok(match position {
+            SeekFrom::Start(position) => {
+                self.position = position;
+                self.position
+            },
+            SeekFrom::End(position) => {todo!()}
+            SeekFrom::Current(delta) => {
+                self.position = ((self.position as i64) + delta) as u64;
+                self.position
+            }
+        })
+    }
+
+    fn rewind(&mut self) -> Result<(), MsBakerError> {
+        self.position = 0;
+
+        Ok(())
+    }
+    
+    fn stream_position(&mut self) -> Result<u64, MsBakerError> {
+        Ok(self.position)
     }
 }

@@ -1,6 +1,7 @@
 //! Errors in the msbaker ecosystem
 
 use snafu::prelude::*;
+use embedded_io::{Error, ErrorKind};
 
 #[derive(Debug, Snafu)]
 pub enum MsBakerError {
@@ -62,4 +63,10 @@ pub enum MsBakerError {
     SdioInTxRx {},
     #[snafu(display("Programmer Error!"))]
     PE {},
+}
+
+impl Error for MsBakerError {
+    fn kind(&self) -> ErrorKind {
+        ErrorKind::Other
+    }
 }

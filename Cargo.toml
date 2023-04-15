@@ -9,6 +9,7 @@ edition = "2021"
 cortex-m = "0.7.2"
 cortex-m-rt = "0.7"
 embedded-hal = { version = "0.2.5", features = ["unproven"] }
+embedded-io = "0.4.0"
 rp2040-pac = "0.4.0"
 rp2040-hal={git="https://github.com/Gip-Gip/rp-hal"}
 rp2040-boot2= "0.2.0"
