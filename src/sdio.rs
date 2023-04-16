@@ -83,7 +83,7 @@ pub const SD_CRC_IDX_MSB: usize = SD_BLOCK_LEN / SD_WORD_DIV;
 pub const SD_CRC_IDX_LSB: usize = SD_CRC_IDX_MSB + 1;
 
 /// Clock speed divider for full speed transfers
-pub const SD_CLK_DIV_FULL: u16 = 25;
+pub const SD_CLK_DIV_FULL: u16 = 2;
 
 /// Clock speed divider for initialization transfers
 pub const SD_CLK_DIV_INIT: u16 = 25;
@@ -1406,11 +1406,98 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Read for Sdio4bit<DMA_CH, P> {
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, MsBakerError> {
         // Wait until we are doing nothing
         self.wait_rx_tx()?;
-        todo!()
+
+        // If the position isn't in the current working block, flush,
+        // then load the correct working block
+        let current_block_num = (self.position / (SD_BLOCK_LEN as u64)) as u32;
+
+        if current_block_num != self.working_block_num {
+            self.flush()?;
+
+            self.working_block_num = current_block_num;
+            self.start_block_rx()?;
+            self.wait_rx()?;
+        }
+
+        let mut working_block = self.working_block.as_ref().unwrap();
+
+        // Ensure buffer_index and self.position are incremented at
+        // the same time
+        let mut buffer_index: usize = 0;
+        let mut block_index: usize = ((self.position % (SD_BLOCK_LEN as u64)) as usize) / SD_WORD_DIV;
+
+        // First read all the bytes that don't align with words
+        let offset = (self.position % (SD_WORD_DIV as u64)) as usize;
+        let shift = offset * 8;
+
+        // If the bytes aren't aligned
+        if shift != 0 {
+            let mut buffer_word: u32 = working_block[block_index] << shift;
+
+            while (self.position % (SD_WORD_DIV as u64)) != 0 && buffer.len() > buffer_index {
+                buffer[buffer_index] = (buffer_word >> 24) as u8;
+                buffer_word <<= 8;
+
+                buffer_index += 1;
+                self.position += 1;
+            }
+           
+            block_index += 1;
+        }
+
+        // Now that the bytes are aligned, time to convert them all
+        // (until we can't)
+        while (buffer.len() - buffer_index) >= SD_WORD_DIV {
+            // Check if the position is now outside of the working block,
+            // and if so return with bytes written
+            if block_index >= (SD_BLOCK_LEN / SD_WORD_DIV) {
+                return Ok(buffer_index)
+            }
+
+            let buffer_bytes = working_block[block_index].to_be_bytes();
+
+            buffer[buffer_index..buffer_index + 4].copy_from_slice(&buffer_bytes);
+
+            // Increment the indicies
+            buffer_index += SD_WORD_DIV as usize;
+            self.position += SD_WORD_DIV as u64;
+            block_index += 1;
+        }
+        
+        // Lastly write all the bytes that don't align with words(again)
+        let remaining = buffer.len() - buffer_index;
+
+        // If the bytes aren't aligned...
+        if remaining > 0 {
+            // Check if the position is now outside of the working block,
+            // and if so return with bytes written
+            if block_index >= (SD_BLOCK_LEN / SD_WORD_DIV) {
+                return Ok(buffer_index)
+            }
+            
+            let mut buffer_word: u32 = working_block[block_index];
+
+            while buffer.len() > buffer_index {
+                buffer[buffer_index] = (buffer_word >> 24) as u8;
+
+                buffer_word <<= 8;
+
+                buffer_index += 1;
+                self.position += 1;
+            }
+        }
+
+        Ok(buffer_index)
     }
 
     fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), ReadExactError<MsBakerError>> {
-        todo!()
+        let mut total = 0;
+
+        while total < buffer.len() {
+            total += self.read(&mut buffer[total..])?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1453,6 +1540,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Write for Sdio4bit<DMA_CH, P> {
             // Mask A keeps all bytes before the data intact, mask b keeps
             // all bytes after the data intact(if the length is 3 or under)
             let mask_a = 0xFFFF_FFFF << (shift + 8);
+            // If we shift 32 it will overflow, so we have to shift twice...
             let mask_b = (0xFFFF_FFFF >> ((8 * remaining) - 1) >> 1);
             let mut buffer_word: u32 = working_block[block_index] & (mask_a | mask_b); 
 

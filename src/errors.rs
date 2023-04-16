@@ -1,7 +1,7 @@
 //! Errors in the msbaker ecosystem
 
 use snafu::prelude::*;
-use embedded_io::{Error, ErrorKind};
+use embedded_io::{Error, ErrorKind, blocking::ReadExactError};
 
 #[derive(Debug, Snafu)]
 pub enum MsBakerError {
@@ -68,5 +68,11 @@ pub enum MsBakerError {
 impl Error for MsBakerError {
     fn kind(&self) -> ErrorKind {
         ErrorKind::Other
+    }
+}
+
+impl From<MsBakerError> for ReadExactError<MsBakerError> {
+    fn from(e: MsBakerError) -> ReadExactError<MsBakerError> {
+        Self::Other(e)
     }
 }

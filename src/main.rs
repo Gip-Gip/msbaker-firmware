@@ -43,7 +43,7 @@ use cortex_m::delay::Delay;
 use arrayvec::ArrayString;
 use core::fmt::{Write as FmtWrite};
 
-use embedded_io::blocking::{Write, Seek};
+use embedded_io::blocking::{Write, Seek, Read};
 use embedded_io::SeekFrom;
 
 #[link_section = ".boot2"]
@@ -160,17 +160,30 @@ fn main_0() -> ! {
 
     let clear:[u8; 256] = [0xFF; 256];
 
-    sd_controller.write_all(&clear).unwrap();
+    sd_controller.write_all(&clear);
+    sd_controller.rewind();
 
-    sd_controller.seek(SeekFrom::Start(0));
+    let hello = "Hello, World! I am doing well!".as_bytes();
+    let mut buf: [u8; 30] = [0; 30];
 
-    let hello = "Hi ".as_bytes();
+    for i in 1..30 {
+        let hello_slice = &hello[..i];
+        let mut buf_slice = &mut buf[..i];
 
-    for _ in 0..256 {
-        sd_controller.write_all(&hello).unwrap();
+        for _ in 0..256 {
+            sd_controller.write_all(hello_slice);
+        }
+
+        sd_controller.flush();
+        sd_controller.rewind();
+
+        for _ in 0..256 {
+            sd_controller.read_exact(&mut buf_slice).unwrap();
+            assert_eq!(buf_slice, hello_slice);
+        }
+
+        sd_controller.rewind();
     }
-
-    sd_controller.flush().unwrap();
 
     pin_led.set_high().unwrap();
 
