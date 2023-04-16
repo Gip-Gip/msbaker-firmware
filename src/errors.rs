@@ -1,28 +1,28 @@
 //! Errors in the msbaker ecosystem
 
+use embedded_io::{blocking::ReadExactError, Error, ErrorKind};
 use snafu::prelude::*;
-use embedded_io::{Error, ErrorKind, blocking::ReadExactError};
 
 #[derive(Debug, Snafu)]
 pub enum MsBakerError {
     #[snafu(display("(SDIO) Timeout on SD command!"))]
-    SdioCmdTimeout {cmd: u8, timeout_time: u32},
+    SdioCmdTimeout { cmd: u8, timeout_time: u32 },
     #[snafu(display("(SDIO) Timeout on write!"))]
     SdioWriteTimeout {},
     #[snafu(display("(SDIO) Response is to the wrong command!"))]
-    SdioWrongCmd {good_cmd: u8, bad_cmd: u8},
+    SdioWrongCmd { good_cmd: u8, bad_cmd: u8 },
     #[snafu(display("(SDIO) Bad rx CRC7!"))]
     SdioBadRxCrc7 {},
     #[snafu(display("(SDIO) Bad tx CRC7!"))]
     SdioBadTxCrc7 {},
     #[snafu(display("(SDIO) Bad rx CRC16!"))]
-    SdioBadRxCrc16 { good_crc: u64, bad_crc: u64},
+    SdioBadRxCrc16 { good_crc: u64, bad_crc: u64 },
     #[snafu(display("(SDIO) Bad tx CRC16!"))]
     SdioBadTxCrc16 {},
     #[snafu(display("(SDIO) Bad CMD8 check pattern!"))]
-    SdioBadCheck {good_check: u8, bad_check: u8},
+    SdioBadCheck { good_check: u8, bad_check: u8 },
     #[snafu(display("(SDIO) Bad CMD8 voltage!"))]
-    SdioBadVoltage {bad_volt: u8},
+    SdioBadVoltage { bad_volt: u8 },
     #[snafu(display("(SDIO) Bad OCR voltage range!"))]
     SdioBadVoltRange {},
     #[snafu(display("(SDIO) Failed to write!"))]
@@ -54,7 +54,7 @@ pub enum MsBakerError {
     #[snafu(display("(SDIO) CSD overwite error!"))]
     SdioCsdOverwrite {},
     #[snafu(display("(SDIO) Wp erase skip!"))]
-    SdioWpEraseSkip{},
+    SdioWpEraseSkip {},
     #[snafu(display("(SDIO) Authentication error!"))]
     SdioAkeSeqError {},
     #[snafu(display("(SDIO) Unknown cmd error!"))]

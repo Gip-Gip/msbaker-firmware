@@ -20,8 +20,8 @@
 #![no_std]
 #![no_main]
 
-mod sdio;
 mod errors;
+mod sdio;
 
 use crate::sdio::Sdio4bit;
 
@@ -32,18 +32,18 @@ use hal::pac;
 
 use hal::dma::DMAExt;
 
-use hal::pio::PIOExt;
 use embedded_hal::blocking::i2c::WriteRead;
 use fugit::RateExtU32;
+use hal::pio::PIOExt;
 
+use cortex_m::delay::Delay;
 use embedded_hal::digital::v2::OutputPin;
 use rp2040_hal::clocks::Clock;
-use cortex_m::delay::Delay;
 
 use arrayvec::ArrayString;
-use core::fmt::{Write as FmtWrite};
+use core::fmt::Write as FmtWrite;
 
-use embedded_io::blocking::{Write, Seek, Read};
+use embedded_io::blocking::{Read, Seek, Write};
 use embedded_io::SeekFrom;
 
 #[link_section = ".boot2"]
@@ -105,7 +105,7 @@ fn main_0() -> ! {
     );
 
     // Initialize the SD card pins
-    let pin_sd_clk = pins.gpio0.into_mode::<hal::gpio::FunctionPio0>(); 
+    let pin_sd_clk = pins.gpio0.into_mode::<hal::gpio::FunctionPio0>();
     let pin_sd_cmd = pins.gpio5.into_mode::<hal::gpio::FunctionPio0>();
     let pin_sd_dat0 = pins.gpio1.into_mode::<hal::gpio::FunctionPio0>();
     let pin_sd_dat1 = pins.gpio2.into_mode::<hal::gpio::FunctionPio0>();
@@ -127,7 +127,7 @@ fn main_0() -> ! {
         sm0,
         sm1,
         pin_sd_clk_id,
-        pin_sd_cmd_id, 
+        pin_sd_cmd_id,
         pin_sd_dat0_id,
     );
 
@@ -148,8 +148,6 @@ fn main_0() -> ! {
     }
 
     // !TODO! Self check for sd card
-    
-
 
     // !TODO! Initialize core 1
 
@@ -158,7 +156,7 @@ fn main_0() -> ! {
     // ===================================================================== //
     // Turn the LED solid to signify all is good!
 
-    let clear:[u8; 256] = [0xFF; 256];
+    let clear: [u8; 256] = [0xFF; 256];
 
     sd_controller.write_all(&clear);
     sd_controller.rewind();
@@ -198,28 +196,24 @@ fn main_1() {
 }
 
 static xmorse: [u8; 256] = [
-    67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 12, 77, 78, 79, 80, 81, 82, 83, 84,
-    85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 0, 35, 65, 98, 99, 100,
-    66, 24, 58, 59, 101, 102, 17, 36, 15, 103, 104, 64, 105, 106, 107, 108,
-    109, 110, 111, 112, 62, 33, 113, 114, 115, 32, 116, 30, 37, 48, 50, 42, 44,
-    40, 27, 28, 63, 45, 41, 39, 46, 34, 43, 53, 49, 38, 29, 60, 61, 31, 117,
-    51, 118, 52, 119, 54, 120, 121, 122, 4, 23, 20, 11, 1, 19, 21, 7, 8, 56,
-    26, 10, 14, 6, 3, 22, 55, 9, 5, 2, 13, 25, 18, 47, 16, 57, 123, 124, 125,
-    126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140,
-    141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
-    156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170,
-    171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185,
-    186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200,
-    201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215,
-    216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230,
-    231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245,
-    246, 247, 248, 249, 250, 251, 252, 253, 254, 255
+    67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 12, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
+    90, 91, 92, 93, 94, 95, 96, 97, 0, 35, 65, 98, 99, 100, 66, 24, 58, 59, 101, 102, 17, 36, 15,
+    103, 104, 64, 105, 106, 107, 108, 109, 110, 111, 112, 62, 33, 113, 114, 115, 32, 116, 30, 37,
+    48, 50, 42, 44, 40, 27, 28, 63, 45, 41, 39, 46, 34, 43, 53, 49, 38, 29, 60, 61, 31, 117, 51,
+    118, 52, 119, 54, 120, 121, 122, 4, 23, 20, 11, 1, 19, 21, 7, 8, 56, 26, 10, 14, 6, 3, 22, 55,
+    9, 5, 2, 13, 25, 18, 47, 16, 57, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134,
+    135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153,
+    154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172,
+    173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191,
+    192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210,
+    211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229,
+    230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248,
+    249, 250, 251, 252, 253, 254, 255,
 ];
 
 #[panic_handler]
 fn panic(panic_info: &PanicInfo) -> ! {
     unsafe {
-
         let mut message_string = ArrayString::<256>::new();
 
         write!(&mut message_string, "{}", panic_info);
@@ -255,13 +249,11 @@ fn panic(panic_info: &PanicInfo) -> ! {
         // Initialize GPIO
         let mut pin_led = pins.gpio25.into_push_pull_output();
 
-
         let mut delay = Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
         loop {
-
             // Flash it at 4hz
-            for _ in 0 .. 4*10 {
+            for _ in 0..4 * 10 {
                 pin_led.set_high();
                 delay.delay_ms(125);
                 pin_led.set_low();
@@ -289,7 +281,7 @@ fn panic(panic_info: &PanicInfo) -> ! {
                     pin_led.set_high();
                     delay.delay_ms(delaytime);
                     pin_led.set_low();
-                    delay.delay_ms(1000-delaytime);
+                    delay.delay_ms(1000 - delaytime);
                     byte >>= 1;
                 }
             }

@@ -21,7 +21,7 @@
 // flags and registers
 //
 // Here are the bit positions for two word commands
-// 
+//
 // Word 0:
 //  6666 5555 5555 5544  4444 4444 3333 3333
 //  3210 9876 5432 1098  7654 3210 9876 5432
@@ -32,21 +32,24 @@
 //  1098 7654 3210 9876  5432 1098 7654 3210
 //  XXXX_XXXX_XXXX_XXXX__XXXX_XXXX_XXXX_XXXX
 
-use embedded_io::blocking::{Read, Write, Seek, ReadExactError, WriteFmtError};
-use embedded_io::Error as IoError;
-use embedded_io::{Io, SeekFrom};
-use hal::pio::{MovStatusConfig, PinDir, ShiftDirection, PIOExt, PIO, PIOBuilder, SM0, SM1, StateMachine, UninitStateMachine, InstalledProgram, Running, Rx, Tx};
-use hal::dma::SingleChannel as SingleChannelDma;
-use hal::dma::single_buffer;
-use hal::dma::single_buffer::{Transfer};
-use pio_proc::pio_file;
-use pio::{Instruction, InstructionOperands, OutDestination, SetDestination, Program};
+use crate::errors::MsBakerError;
+use core::fmt::Arguments;
+use core::{cmp, mem};
 use cortex_m::delay::Delay;
 use cortex_m::singleton;
+use embedded_io::blocking::{Read, ReadExactError, Seek, Write, WriteFmtError};
+use embedded_io::Error as IoError;
+use embedded_io::{Io, SeekFrom};
+use hal::dma::single_buffer;
+use hal::dma::single_buffer::Transfer;
+use hal::dma::SingleChannel as SingleChannelDma;
+use hal::pio::{
+    InstalledProgram, MovStatusConfig, PIOBuilder, PIOExt, PinDir, Running, Rx, ShiftDirection,
+    StateMachine, Tx, UninitStateMachine, PIO, SM0, SM1,
+};
+use pio::{Instruction, InstructionOperands, OutDestination, Program, SetDestination};
+use pio_proc::pio_file;
 use rp2040_hal as hal;
-use core::{mem, cmp};
-use core::fmt::Arguments;
-use crate::errors::MsBakerError;
 
 /// Timeout for SD commands, in microseconds
 pub const SD_CMD_TIMEOUT_US: u32 = 1_000_000;
@@ -71,7 +74,6 @@ pub const SD_BLOCK_LEN_TOTAL: usize = SD_BLOCK_LEN + SD_BLOCK_CRC_LEN + SD_BLOCK
 /// Multiplier for nibbles
 
 pub const SD_NIBBLE_MULT: usize = 2;
-
 
 /// Divider for words
 
@@ -120,7 +122,7 @@ pub fn calculate_crc7_from_words(words: &[u32], skip: usize, len: usize) -> u8 {
     let mut word = start_word;
     let mut shift = start_shift;
 
-    for _ in 0 .. len {
+    for _ in 0..len {
         // Calculate crc
         let byte = ((words[word] >> shift) & 0xFF) as u8;
         let index = byte ^ crc;
@@ -131,8 +133,7 @@ pub fn calculate_crc7_from_words(words: &[u32], skip: usize, len: usize) -> u8 {
         if shift == 0 {
             shift = 24;
             word += 1;
-        }
-        else {
+        } else {
             shift -= 8;
         }
     }
@@ -141,10 +142,10 @@ pub fn calculate_crc7_from_words(words: &[u32], skip: usize, len: usize) -> u8 {
 }
 
 // This crc algorithm is based on the CRC16 generator/checker specified in the
-// Part 1 Physical Layer Simplified Specification 
+// Part 1 Physical Layer Simplified Specification
 pub fn crc16_4bit(data: &[u32]) -> u64 {
     let mut crc: u64 = 0;
-    
+
     let mut i = 0;
 
     // Simulate a hardware crc calculator
@@ -253,14 +254,13 @@ impl SdCmd {
     pub fn get_cmd_response(&self) -> SdCmdResponseType {
         match self {
             SdCmd::GoIdleState => SdCmdResponseType::R0,
-            SdCmd::SetBlockLen(_) |
-                SdCmd::ReadSingleBlock(_) |
-                SdCmd::WriteBlock(_) |
-                SdCmd::AppCmd(_)|
-                SdCmd::SetBusWidth(_) => SdCmdResponseType::R1,
+            SdCmd::SetBlockLen(_)
+            | SdCmd::ReadSingleBlock(_)
+            | SdCmd::WriteBlock(_)
+            | SdCmd::AppCmd(_)
+            | SdCmd::SetBusWidth(_) => SdCmdResponseType::R1,
             SdCmd::SelectDeselectCard(_) => SdCmdResponseType::R1b,
-            SdCmd::AllSendCid |
-                SdCmd::SendCsd(_) => SdCmdResponseType::R2,
+            SdCmd::AllSendCid | SdCmd::SendCsd(_) => SdCmdResponseType::R2,
             SdCmd::SdAppOpCond(_, _, _, _) => SdCmdResponseType::R3,
             SdCmd::SendRelativeAddr => SdCmdResponseType::R6,
             SdCmd::SendIfCond(_) => SdCmdResponseType::R7,
@@ -270,18 +270,17 @@ impl SdCmd {
     /// Returns true if a command is an app command
     pub fn is_acmd(&self) -> bool {
         match self {
-            SdCmd::GoIdleState |
-                SdCmd::AllSendCid |
-                SdCmd::SendRelativeAddr |
-                SdCmd::SelectDeselectCard(_) |
-                SdCmd::SendIfCond(_) |
-                SdCmd::SendCsd(_) |
-                SdCmd::SetBlockLen(_) |
-                SdCmd::ReadSingleBlock(_) |
-                SdCmd::WriteBlock(_) |
-                SdCmd::AppCmd(_) => false,
-            SdCmd::SetBusWidth(_) |
-                SdCmd::SdAppOpCond(_, _, _, _) => true,
+            SdCmd::GoIdleState
+            | SdCmd::AllSendCid
+            | SdCmd::SendRelativeAddr
+            | SdCmd::SelectDeselectCard(_)
+            | SdCmd::SendIfCond(_)
+            | SdCmd::SendCsd(_)
+            | SdCmd::SetBlockLen(_)
+            | SdCmd::ReadSingleBlock(_)
+            | SdCmd::WriteBlock(_)
+            | SdCmd::AppCmd(_) => false,
+            SdCmd::SetBusWidth(_) | SdCmd::SdAppOpCond(_, _, _, _) => true,
         }
     }
 
@@ -305,9 +304,9 @@ impl SdCmd {
 
         // Bits 47-16 is the argument
         match self {
-            Self::SetBlockLen(unsigned32) |
-                Self::ReadSingleBlock(unsigned32) |
-                Self::WriteBlock(unsigned32) => {
+            Self::SetBlockLen(unsigned32)
+            | Self::ReadSingleBlock(unsigned32)
+            | Self::WriteBlock(unsigned32) => {
                 data[0] |= (unsigned32 >> 16) & 0xFFFF;
                 data[1] |= (unsigned32 << 16) & 0xFFFF_0000;
             }
@@ -330,33 +329,29 @@ impl SdCmd {
                 // Bit 47 is reserved
                 // Bit 46 is the HCS
                 if *hcs {
-                    data[0] |= 1<<14;
+                    data[0] |= 1 << 14;
                 }
                 // Bit 45 is reserved
                 // Bit 44 is XPC
                 if *xpc {
-                    data[0] |= 1<<12;
+                    data[0] |= 1 << 12;
                 }
                 // Bits 43-41 are reserved
                 // Bit 40 is S18R
                 if *s18r {
-                    data[0] |= 1<<8;
+                    data[0] |= 1 << 8;
                 }
 
                 // Bits 39-16 is the Voltage Window
                 data[0] |= (voltage_window >> 16) & 0xFF;
                 data[1] |= (voltage_window << 16) & 0xFFFF_0000;
             }
-            Self::SelectDeselectCard(rca)|
-                Self::SendCsd(rca) |
-                Self::AppCmd(rca) => {
+            Self::SelectDeselectCard(rca) | Self::SendCsd(rca) | Self::AppCmd(rca) => {
                 // Bits 47-32 are the RCA, 31-16 are stuff bits
                 data[0] |= *rca as u32;
             }
             // And some commands don't have an argument
-            Self::GoIdleState |
-                Self::AllSendCid |
-                Self::SendRelativeAddr => {}
+            Self::GoIdleState | Self::AllSendCid | Self::SendRelativeAddr => {}
         }
 
         // Bits 15-9 is the crc7 of the command, processed in big endian
@@ -449,7 +444,7 @@ impl SdCardStatus {
         if self.cc_error() {
             return Err(MsBakerError::SdioCcError {});
         }
-        
+
         if self.com_crc_error() {
             return Err(MsBakerError::SdioBadTxCrc7 {});
         }
@@ -465,35 +460,35 @@ impl SdCardStatus {
         if self.out_of_range() {
             return Err(MsBakerError::SdioOutOfRange {});
         }
-        
+
         if self.address_error() {
             return Err(MsBakerError::SdioAddressError {});
         }
-        
+
         if self.block_len_error() {
             return Err(MsBakerError::SdioBlockLenError {});
         }
-        
+
         if self.erase_seq_error() {
             return Err(MsBakerError::SdioEraseSeqError {});
         }
-        
+
         if self.erase_param() {
-            return Err(MsBakerError::SdioEraseParamError{});
+            return Err(MsBakerError::SdioEraseParamError {});
         }
-        
+
         if self.wp_violation() {
-            return Err(MsBakerError::SdioWpViolation{});
+            return Err(MsBakerError::SdioWpViolation {});
         }
-        
+
         if self.lock_unlocked_failed() {
             return Err(MsBakerError::SdioLockUnlockFailed {});
         }
-        
+
         if self.wp_erase_skip() {
             return Err(MsBakerError::SdioWpEraseSkip {});
         }
-        
+
         if self.ake_seq_error() {
             return Err(MsBakerError::SdioAkeSeqError {});
         }
@@ -503,87 +498,87 @@ impl SdCardStatus {
 
     /// Returns true if the OUT_OF_RANGE bit is set
     pub fn out_of_range(&self) -> bool {
-        (self.card_status & (1<<31)) > 0
+        (self.card_status & (1 << 31)) > 0
     }
     /// Returns true if the ADDRESS_ERROR bit is set
     pub fn address_error(&self) -> bool {
-        (self.card_status & (1<<30)) > 0
+        (self.card_status & (1 << 30)) > 0
     }
     /// Returns true if the BLOCK_LEN_ERROR bit is set
     pub fn block_len_error(&self) -> bool {
-        (self.card_status & (1<<29)) > 0
+        (self.card_status & (1 << 29)) > 0
     }
     /// Returns true if the ERASE_SEQ_ERROR bit is set
     pub fn erase_seq_error(&self) -> bool {
-        (self.card_status & (1<<28)) > 0
+        (self.card_status & (1 << 28)) > 0
     }
     /// Returns true if the ERASE_PARAM bit is set
     pub fn erase_param(&self) -> bool {
-        (self.card_status & (1<<27)) > 0
+        (self.card_status & (1 << 27)) > 0
     }
     /// Returns true if the WP_VIOLATION bit is set
     pub fn wp_violation(&self) -> bool {
-        (self.card_status & (1<<26)) > 0
+        (self.card_status & (1 << 26)) > 0
     }
     /// Returns true if the CARD_IS_LOCKED bit is set
     pub fn card_is_locked(&self) -> bool {
-        (self.card_status & (1<<25)) > 0
+        (self.card_status & (1 << 25)) > 0
     }
     /// Returns true if the LOCK_UNLOCK_FAILED bit is set
     pub fn lock_unlocked_failed(&self) -> bool {
-        (self.card_status & (1<<24)) > 0
+        (self.card_status & (1 << 24)) > 0
     }
     /// Returns true if the COM_CRC_ERROR bit is set
     pub fn com_crc_error(&self) -> bool {
-        (self.card_status & (1<<23)) > 0
+        (self.card_status & (1 << 23)) > 0
     }
     /// Returns true if the ILLEGAL_COMMAND bit is set
     pub fn illegal_command(&self) -> bool {
-        (self.card_status & (1<<22)) > 0
+        (self.card_status & (1 << 22)) > 0
     }
     /// Returns true if the CARD_ECC_FAILED bit is set
     pub fn card_ecc_failed(&self) -> bool {
-        (self.card_status & (1<<21)) > 0
+        (self.card_status & (1 << 21)) > 0
     }
     /// Returns true if the CC_ERROR bit is set
     pub fn cc_error(&self) -> bool {
-        (self.card_status & (1<<20)) > 0
+        (self.card_status & (1 << 20)) > 0
     }
     /// Returns true if the ERROR bit is set
     pub fn error(&self) -> bool {
-        (self.card_status & (1<<19)) > 0
+        (self.card_status & (1 << 19)) > 0
     }
     /// Returns true if the CSD_OVERWRITE bit is set
     pub fn csd_overwrite(&self) -> bool {
-        (self.card_status & (1<<16)) > 0
+        (self.card_status & (1 << 16)) > 0
     }
     /// Returns true if the WP_ERASE_SKIP bit is set
     pub fn wp_erase_skip(&self) -> bool {
-        (self.card_status & (1<<15)) > 0
+        (self.card_status & (1 << 15)) > 0
     }
     /// Returns true if the CARD_ECC_DISABLED bit is set
     pub fn card_ecc_disabled(&self) -> bool {
-        (self.card_status & (1<<14)) > 0
+        (self.card_status & (1 << 14)) > 0
     }
     /// Returns true if the ERASE_RESET bit is set
     pub fn erase_reset(&self) -> bool {
-        (self.card_status & (1<<13)) > 0
+        (self.card_status & (1 << 13)) > 0
     }
     /// Returns true if the READY_FOR_DATA bit is set
     pub fn ready_for_data(&self) -> bool {
-        (self.card_status & (1<<8)) > 0
+        (self.card_status & (1 << 8)) > 0
     }
     /// Returns true if the FX_EVENT bit is set
     pub fn fx_event(&self) -> bool {
-        (self.card_status & (1<<6)) > 0
+        (self.card_status & (1 << 6)) > 0
     }
     /// Returns true if the APP_CMD bit is set
     pub fn app_cmd(&self) -> bool {
-        (self.card_status & (1<<5)) > 0
+        (self.card_status & (1 << 5)) > 0
     }
     /// Returns true if the AKE_SEQ_ERROR bit is set
     pub fn ake_seq_error(&self) -> bool {
-        (self.card_status & (1<<3)) > 0
+        (self.card_status & (1 << 3)) > 0
     }
 }
 
@@ -637,28 +632,28 @@ impl SdOcr {
     }
     /// Returns true if the card is busy
     pub fn is_busy(&self) -> bool {
-        (self.ocr & (1<<31)) == 0
+        (self.ocr & (1 << 31)) == 0
     }
     /// Returns true if the card supports switching to 1.8v
     pub fn s18a(&self) -> bool {
-        (self.ocr & (1<<24)) > 0
+        (self.ocr & (1 << 24)) > 0
     }
     /// Returns true if the card supports a capacity over 2 terabytes
     pub fn co2t(&self) -> bool {
-        (self.ocr & (1<<27)) > 0
+        (self.ocr & (1 << 27)) > 0
     }
     /// Returns true if the card supports UHS-II
     pub fn uhs2(&self) -> bool {
-        (self.ocr & (1<<29)) > 0
+        (self.ocr & (1 << 29)) > 0
     }
     /// Returns true if the CCS bit is set
     pub fn ccs(&self) -> bool {
-        (self.ocr & (1<<30)) > 0
+        (self.ocr & (1 << 30)) > 0
     }
 }
 
 pub struct SdCic {
-    /// Set to true if the card 
+    /// Set to true if the card
     pub supports_1p2v: bool,
     /// Set to true if the card supports pcie
     pub supports_pcie: bool,
@@ -686,7 +681,7 @@ pub struct Sdio4bit<DMA_CH: SingleChannelDma, P: PIOExt> {
     /// The data transmit program
     /// Is an option since it can be used up during a tx
     program_data_tx: Option<InstalledProgram<P>>,
-    
+
     /// The CID register for the card
     cid: SdCid,
     /// The RCA register for the card
@@ -708,21 +703,26 @@ pub struct Sdio4bit<DMA_CH: SingleChannelDma, P: PIOExt> {
     sm_dat_tx: Option<Tx<(P, SM1)>>,
 
     /// Home for DMA and running state machine during TX and RX
-    tx_dma_in_use: Option<Transfer<DMA_CH, &'static mut [u32; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV], Tx<(P, SM1)>>>,
-    rx_dma_in_use: Option<Transfer<DMA_CH, Rx<(P, SM1)>, &'static mut [u32; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV]>>,
+    tx_dma_in_use: Option<
+        Transfer<DMA_CH, &'static mut [u32; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV], Tx<(P, SM1)>>,
+    >,
+    rx_dma_in_use: Option<
+        Transfer<DMA_CH, Rx<(P, SM1)>, &'static mut [u32; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV]>,
+    >,
     sm_in_use: Option<StateMachine<(P, SM1), Running>>,
 }
 
 impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
     pub fn new(
-            mut pio: PIO<P>,
-            dma: DMA_CH,
-            mut delay: Delay,
-            sm0: UninitStateMachine<(P, SM0)>,
-            sm1: UninitStateMachine<(P, SM1)>,
-            sd_clk_id: u8,
-            sd_cmd_id: u8,
-            sd_dat_base_id: u8) -> Self {
+        mut pio: PIO<P>,
+        dma: DMA_CH,
+        mut delay: Delay,
+        sm0: UninitStateMachine<(P, SM0)>,
+        sm1: UninitStateMachine<(P, SM1)>,
+        sd_clk_id: u8,
+        sd_cmd_id: u8,
+        sd_dat_base_id: u8,
+    ) -> Self {
         // Initialilze the raw program variables from the rp2040_sdio.pio file
         let program_cmd_clk =
             pio_file!("src/rp2040_sdio.pio", select_program("sdio_cmd_clk")).program;
@@ -750,9 +750,8 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
             .autopush(true)
             .autopull(true)
             .build(sm0);
-        
-        let mut working_block = singleton!(: [u32; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV] = [0xAF; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV]).unwrap();
 
+        let mut working_block = singleton!(: [u32; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV] = [0xAF; SD_BLOCK_LEN_TOTAL / SD_WORD_DIV]).unwrap();
 
         sm_cmd.set_pindirs([(sd_clk_id, PinDir::Output), (sd_cmd_id, PinDir::Output)]);
         // Start the state machine
@@ -821,7 +820,10 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
             let mut timeout_us = SD_CMD_TIMEOUT_US;
             while self.sm_cmd_rx.is_empty() {
                 if timeout_us == 0 {
-                    return Err(MsBakerError::SdioCmdTimeout{cmd: command.get_cmd_index(), timeout_time: SD_CMD_TIMEOUT_US});
+                    return Err(MsBakerError::SdioCmdTimeout {
+                        cmd: command.get_cmd_index(),
+                        timeout_time: SD_CMD_TIMEOUT_US,
+                    });
                 }
                 self.delay.delay_us(1);
                 timeout_us -= 1;
@@ -849,22 +851,28 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
             let crc = ((resp_buf[1] >> 16) & 0xFE) as u8;
 
             if good_crc != crc {
-                return Err(MsBakerError::SdioBadRxCrc7{});
+                return Err(MsBakerError::SdioBadRxCrc7 {});
             }
-            
+
             let good_command_index = command.get_cmd_index();
 
-            let command_index = ((resp_buf[0]>> 24) & 0x3F) as u8;
+            let command_index = ((resp_buf[0] >> 24) & 0x3F) as u8;
 
             if good_command_index != command_index {
-                return Err(MsBakerError::SdioWrongCmd {good_cmd: good_command_index, bad_cmd: command_index});
+                return Err(MsBakerError::SdioWrongCmd {
+                    good_cmd: good_command_index,
+                    bad_cmd: command_index,
+                });
             }
         }
 
         // Construct the response
         match response_type {
             SdCmdResponseType::R1 => {
-                let card_status = SdCardStatus { card_status: ((resp_buf[0] & 0x00FF_FFFF) << 8) | ((resp_buf[1] & 0xFF00_0000) >> 24) };
+                let card_status = SdCardStatus {
+                    card_status: ((resp_buf[0] & 0x00FF_FFFF) << 8)
+                        | ((resp_buf[1] & 0xFF00_0000) >> 24),
+                };
 
                 // Make sure we didn't get any errors
                 card_status.get_worst_error()?;
@@ -872,7 +880,10 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
                 Ok(SdCmdResponse::R1(card_status))
             }
             SdCmdResponseType::R1b => {
-                let card_status = SdCardStatus { card_status: ((resp_buf[0] & 0x00FF_FFFF) << 8) | ((resp_buf[1] & 0xFF00_0000) >> 24) };
+                let card_status = SdCardStatus {
+                    card_status: ((resp_buf[0] & 0x00FF_FFFF) << 8)
+                        | ((resp_buf[1] & 0xFF00_0000) >> 24),
+                };
 
                 card_status.get_worst_error()?;
 
@@ -893,9 +904,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
             SdCmdResponseType::R3 => {
                 let ocr = ((resp_buf[0] & 0x00FF_FFFF) << 8) | ((resp_buf[1] & 0xFF00_0000) >> 24);
 
-                Ok(SdCmdResponse::R3(SdOcr {
-                    ocr
-                }))
+                Ok(SdCmdResponse::R3(SdOcr { ocr }))
             }
             SdCmdResponseType::R6 => {
                 let rca: u16 = ((resp_buf[0] & 0x00FF_FF00) >> 8) as u16;
@@ -909,35 +918,37 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
             SdCmdResponseType::R7 => {
                 let good_check_pattern = match command {
                     SdCmd::SendIfCond(check_pattern) => check_pattern,
-                    _ => {return Err(MsBakerError::PE {})}
+                    _ => return Err(MsBakerError::PE {}),
                 };
                 // Bit 21 is the 1.2v support bit, 20 is the pcie support
                 //                                   4444 4444 3333 3333  3322 2222 2222 1111
                 //                                   7654 3210 9876 5432  1098 7654 3210 9876
                 let supports_1p2v = (resp_buf[0] & 0x0000_0000_0000_0000__0000_0000_0010_0000) > 0;
                 let supports_pcie = (resp_buf[0] & 0x0000_0000_0000_0000__0000_0000_0001_0000) > 0;
-                
+
                 // Verify the correct voltage is in use
                 let voltage = (resp_buf[0] & 0x0000_0000_0000_0000__0000_0000_0000_1111) as u8;
 
                 if voltage != 0b0001 {
-                    return Err(MsBakerError::SdioBadVoltage{bad_volt : voltage});
+                    return Err(MsBakerError::SdioBadVoltage { bad_volt: voltage });
                 }
 
                 // Verify the check pattern
                 let check_pattern = ((resp_buf[1] >> 24) & 0xFF) as u8;
 
                 if check_pattern != good_check_pattern {
-                    return Err(MsBakerError::SdioBadCheck{good_check: good_check_pattern, bad_check: check_pattern});
+                    return Err(MsBakerError::SdioBadCheck {
+                        good_check: good_check_pattern,
+                        bad_check: check_pattern,
+                    });
                 }
-
 
                 Ok(SdCmdResponse::R7(SdCic {
                     supports_1p2v,
                     supports_pcie,
                 }))
             }
-            SdCmdResponseType::R0 => {Err(MsBakerError::PE {})} // Shouldn't happen
+            SdCmdResponseType::R0 => Err(MsBakerError::PE {}), // Shouldn't happen
         }
     }
 
@@ -959,10 +970,9 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         let program = mem::take(&mut self.program_data_tx).unwrap();
         let working_block = mem::take(&mut self.working_block).unwrap();
 
-        
         // Calculate the crc of the block and place it at the end of the block
         let crc = crc16_4bit(&working_block[..SD_BLOCK_LEN / SD_WORD_DIV]);
-        
+
         let len = working_block.len();
 
         working_block[SD_CRC_IDX_LSB] = (crc & 0xFFFF_FFFF) as u32;
@@ -986,41 +996,41 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         // Manually store the nibble count and response bit count to X an Y
         sm_dat_tx.write((SD_BLOCK_LEN_TOTAL * SD_NIBBLE_MULT) as u32);
         sm_dat.exec_instruction(Instruction {
-            operands: InstructionOperands::OUT{
+            operands: InstructionOperands::OUT {
                 destination: OutDestination::X,
                 bit_count: 32,
             },
             delay: 0,
-            side_set: None
+            side_set: None,
         });
-        
+
         sm_dat_tx.write(31);
         sm_dat.exec_instruction(Instruction {
-            operands: InstructionOperands::OUT{
+            operands: InstructionOperands::OUT {
                 destination: OutDestination::Y,
                 bit_count: 32,
             },
             delay: 0,
-            side_set: None
+            side_set: None,
         });
 
         // Initialize the pins and output to high
         sm_dat.exec_instruction(Instruction {
-            operands: InstructionOperands::SET{
+            operands: InstructionOperands::SET {
                 destination: SetDestination::PINS,
                 data: 0xF,
             },
             delay: 0,
-            side_set: None
+            side_set: None,
         });
-        
+
         sm_dat.exec_instruction(Instruction {
-            operands: InstructionOperands::SET{
+            operands: InstructionOperands::SET {
                 destination: SetDestination::PINDIRS,
                 data: 0xF,
             },
             delay: 0,
-            side_set: None
+            side_set: None,
         });
 
         // prep the state machine with the start token
@@ -1031,7 +1041,6 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
 
         // Send the write block command
         self.send_command(SdCmd::WriteBlock(self.working_block_num))?;
-
 
         // Start the state machine and DMA
         let tx_transfer = tx_transfer.start();
@@ -1046,7 +1055,6 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
     }
 
     pub fn check_write_response(mut resp: u32) -> Result<(), MsBakerError> {
-
         if (!resp & 0xFFFF_0000) == 0 {
             resp <<= 16;
         }
@@ -1071,9 +1079,9 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
 
         match resp {
             2 => Ok(()),
-            5 => Err(MsBakerError::SdioBadTxCrc16{}),
-            6 => Err(MsBakerError::SdioWriteFail{}),
-            _ => Err(MsBakerError::SdioWriteUnknown{}),
+            5 => Err(MsBakerError::SdioBadTxCrc16 {}),
+            6 => Err(MsBakerError::SdioWriteFail {}),
+            _ => Err(MsBakerError::SdioWriteUnknown {}),
         }
     }
 
@@ -1090,13 +1098,11 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         // Return false if we don't need to poll tx, true if the DMA is still transferring
         let ready = match &self.tx_dma_in_use {
             Some(tx_dma) => tx_dma.is_done(),
-            None => {
-                return Ok(false)
-            },
+            None => return Ok(false),
         };
 
         if !ready {
-            return Ok(true)
+            return Ok(true);
         }
 
         // Wait until there is something in the fifo
@@ -1121,7 +1127,9 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
 
         // Deconstruct the state machine
         let sm_dat_rx = mem::take(&mut self.sm_dat_rx).unwrap();
-        let (sm_dat, program_data_tx) = mem::take(&mut self.sm_in_use).unwrap().uninit(sm_dat_rx, sm_dat_tx);
+        let (sm_dat, program_data_tx) = mem::take(&mut self.sm_in_use)
+            .unwrap()
+            .uninit(sm_dat_rx, sm_dat_tx);
 
         // Replace the appropriate borrowed variables
         self.program_data_tx = Some(program_data_tx);
@@ -1132,7 +1140,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         let response = match response {
             Some(response) => response,
             None => {
-                return Err(MsBakerError::SdioWriteTimeout{});
+                return Err(MsBakerError::SdioWriteTimeout {});
             }
         };
 
@@ -1180,42 +1188,42 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         // Manually store the nibble count to X
         sm_dat_tx.write((SD_BLOCK_LEN_TOTAL * SD_NIBBLE_MULT) as u32);
         sm_dat.exec_instruction(Instruction {
-            operands: InstructionOperands::OUT{
+            operands: InstructionOperands::OUT {
                 destination: OutDestination::X,
                 bit_count: 32,
             },
             delay: 0,
-            side_set: None
+            side_set: None,
         });
-        
+
         // Initialize the pins and output to high (not setting the pins to high
         // can cause errors in testing...)
         sm_dat.exec_instruction(Instruction {
-            operands: InstructionOperands::SET{
+            operands: InstructionOperands::SET {
                 destination: SetDestination::PINS,
                 data: 0xF,
             },
             delay: 0,
-            side_set: None
+            side_set: None,
         });
-        
+
         sm_dat.exec_instruction(Instruction {
-            operands: InstructionOperands::SET{
+            operands: InstructionOperands::SET {
                 destination: SetDestination::PINDIRS,
                 data: 0xF,
             },
             delay: 0,
-            side_set: None
+            side_set: None,
         });
-        
+
         // Initialize the pins to input
         sm_dat.exec_instruction(Instruction {
-            operands: InstructionOperands::SET{
+            operands: InstructionOperands::SET {
                 destination: SetDestination::PINDIRS,
                 data: 0x0,
             },
             delay: 0,
-            side_set: None
+            side_set: None,
         });
 
         // Initialize the DMA transfer
@@ -1239,9 +1247,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
     /// Return true if you need to poll rx
     pub fn is_rx(&self) -> bool {
         match &self.rx_dma_in_use {
-            Some(rx_dma) => {
-                true
-            },
+            Some(rx_dma) => true,
             None => false,
         }
     }
@@ -1250,26 +1256,27 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         // Return false if we don't need to poll rx, true if the DMA is still transferring
         let ready = match &self.rx_dma_in_use {
             Some(tx_dma) => tx_dma.is_done(),
-            None => {
-                return Ok(false)
-            },
+            None => return Ok(false),
         };
 
         if !ready {
-            return Ok(true)
+            return Ok(true);
         }
-        
+
         // Put away everything we used
         // Deconstruct the DMA
         let (dma, sm_dat_rx, working_block) = mem::take(&mut self.rx_dma_in_use).unwrap().wait();
 
         // Deconstruct the state machine
         let sm_dat_tx = mem::take(&mut self.sm_dat_tx).unwrap();
-        let (sm_dat, program_data_rx) = mem::take(&mut self.sm_in_use).unwrap().uninit(sm_dat_rx, sm_dat_tx);
+        let (sm_dat, program_data_rx) = mem::take(&mut self.sm_in_use)
+            .unwrap()
+            .uninit(sm_dat_rx, sm_dat_tx);
 
         // Save the CRC for later
 
-        let crc: u64 = (working_block[SD_CRC_IDX_LSB] as u64) | ((working_block[SD_CRC_IDX_MSB] as u64) << 32);
+        let crc: u64 =
+            (working_block[SD_CRC_IDX_LSB] as u64) | ((working_block[SD_CRC_IDX_MSB] as u64) << 32);
         let good_crc = crc16_4bit(&working_block[..SD_BLOCK_LEN / SD_WORD_DIV]);
 
         // Replace the appropriate borrowed variables
@@ -1279,9 +1286,12 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         self.sm_dat = Some(sm_dat);
 
         // Check the crc and if it's bad, error out!
-        
+
         if crc != good_crc {
-            return Err(MsBakerError::SdioBadRxCrc16 {good_crc, bad_crc: crc});
+            return Err(MsBakerError::SdioBadRxCrc16 {
+                good_crc,
+                bad_crc: crc,
+            });
         }
 
         // Return false since we are no longer transferring!
@@ -1303,11 +1313,11 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
     pub fn poll_rx_tx(&mut self) -> Result<bool, MsBakerError> {
         // If the tx dma or rx dma is Some, call the appropriate poll function
         if let Some(_) = self.tx_dma_in_use {
-            return self.poll_tx()
+            return self.poll_tx();
         }
 
         if let Some(_) = self.rx_dma_in_use {
-            return self.poll_rx()
+            return self.poll_rx();
         }
 
         // Otherwise, neither are in use
@@ -1328,11 +1338,11 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
 
         // Send CMD0
         self.send_command(SdCmd::GoIdleState)?;
-        
+
         // Send CMD8
         let cic = match self.send_command(SdCmd::SendIfCond(0xAA))? {
             SdCmdResponse::R7(cic) => cic,
-            _ => {return Err(MsBakerError::PE {})}
+            _ => return Err(MsBakerError::PE {}),
         };
 
         // Send ACMD41 until the card is no longer busy, and once ready verify
@@ -1340,25 +1350,25 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         let acmd41 = SdCmd::SdAppOpCond(true, true, false, SD_OCR_VOLT_RANGE);
 
         let mut is_busy = true;
-        let mut ocr = SdOcr {ocr: 0};
+        let mut ocr = SdOcr { ocr: 0 };
 
         while is_busy {
             ocr = match self.send_command(acmd41)? {
                 SdCmdResponse::R3(ocr) => ocr,
-                _ => {return Err(MsBakerError::PE {})}
+                _ => return Err(MsBakerError::PE {}),
             };
 
             is_busy = ocr.is_busy();
         }
 
         if (ocr.get_voltage_window() & SD_OCR_VOLT_RANGE) != SD_OCR_VOLT_RANGE {
-            return Err(MsBakerError::SdioBadVoltRange{})
+            return Err(MsBakerError::SdioBadVoltRange {});
         }
 
         // Get the CID
         let cid = match self.send_command(SdCmd::AllSendCid)? {
             SdCmdResponse::R2(cid) => cid,
-            _ => {return Err(MsBakerError::PE {})}
+            _ => return Err(MsBakerError::PE {}),
         };
 
         self.cid = SdCid { cid };
@@ -1366,7 +1376,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         // Get the RCA
         let rca = match self.send_command(SdCmd::SendRelativeAddr)? {
             SdCmdResponse::R6(rca) => rca,
-            _ => {return Err(MsBakerError::PE {})}
+            _ => return Err(MsBakerError::PE {}),
         };
 
         self.rca = rca;
@@ -1374,7 +1384,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Sdio4bit<DMA_CH, P> {
         // Get the CSD
         let csd = match self.send_command(SdCmd::SendCsd(rca))? {
             SdCmdResponse::R2(csd) => csd,
-            _ => {return Err(MsBakerError::PE {})}
+            _ => return Err(MsBakerError::PE {}),
         };
 
         self.csd = SdCsd { csd };
@@ -1424,7 +1434,8 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Read for Sdio4bit<DMA_CH, P> {
         // Ensure buffer_index and self.position are incremented at
         // the same time
         let mut buffer_index: usize = 0;
-        let mut block_index: usize = ((self.position % (SD_BLOCK_LEN as u64)) as usize) / SD_WORD_DIV;
+        let mut block_index: usize =
+            ((self.position % (SD_BLOCK_LEN as u64)) as usize) / SD_WORD_DIV;
 
         // First read all the bytes that don't align with words
         let offset = (self.position % (SD_WORD_DIV as u64)) as usize;
@@ -1441,7 +1452,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Read for Sdio4bit<DMA_CH, P> {
                 buffer_index += 1;
                 self.position += 1;
             }
-           
+
             block_index += 1;
         }
 
@@ -1451,7 +1462,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Read for Sdio4bit<DMA_CH, P> {
             // Check if the position is now outside of the working block,
             // and if so return with bytes written
             if block_index >= (SD_BLOCK_LEN / SD_WORD_DIV) {
-                return Ok(buffer_index)
+                return Ok(buffer_index);
             }
 
             let buffer_bytes = working_block[block_index].to_be_bytes();
@@ -1463,7 +1474,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Read for Sdio4bit<DMA_CH, P> {
             self.position += SD_WORD_DIV as u64;
             block_index += 1;
         }
-        
+
         // Lastly write all the bytes that don't align with words(again)
         let remaining = buffer.len() - buffer_index;
 
@@ -1472,9 +1483,9 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Read for Sdio4bit<DMA_CH, P> {
             // Check if the position is now outside of the working block,
             // and if so return with bytes written
             if block_index >= (SD_BLOCK_LEN / SD_WORD_DIV) {
-                return Ok(buffer_index)
+                return Ok(buffer_index);
             }
-            
+
             let mut buffer_word: u32 = working_block[block_index];
 
             while buffer.len() > buffer_index {
@@ -1527,7 +1538,8 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Write for Sdio4bit<DMA_CH, P> {
         // Ensure buffer_index and self.position are incremented at
         // the same time
         let mut buffer_index: usize = 0;
-        let mut block_index: usize = ((self.position % (SD_BLOCK_LEN as u64)) as usize) / SD_WORD_DIV;
+        let mut block_index: usize =
+            ((self.position % (SD_BLOCK_LEN as u64)) as usize) / SD_WORD_DIV;
 
         // First write all the bytes that don't align with words
         let offset = (self.position % (SD_WORD_DIV as u64)) as usize;
@@ -1542,9 +1554,9 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Write for Sdio4bit<DMA_CH, P> {
             let mask_a = 0xFFFF_FFFF << (shift + 8);
             // If we shift 32 it will overflow, so we have to shift twice...
             let mask_b = (0xFFFF_FFFF >> ((8 * remaining) - 1) >> 1);
-            let mut buffer_word: u32 = working_block[block_index] & (mask_a | mask_b); 
+            let mut buffer_word: u32 = working_block[block_index] & (mask_a | mask_b);
 
-            while shift > 0 && buffer.len() > buffer_index{
+            while shift > 0 && buffer.len() > buffer_index {
                 buffer_word |= (buffer[buffer_index] as u32) << shift;
 
                 shift -= 8;
@@ -1557,7 +1569,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Write for Sdio4bit<DMA_CH, P> {
                 buffer_index += 1;
                 self.position += 1;
             }
-           
+
             // Write the buffer word to the working block
             working_block[block_index] = buffer_word;
             block_index += 1;
@@ -1569,7 +1581,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Write for Sdio4bit<DMA_CH, P> {
             // Check if the position is now outside of the working block,
             // and if so return with bytes written
             if block_index >= (SD_BLOCK_LEN / SD_WORD_DIV) {
-                return Ok(buffer_index)
+                return Ok(buffer_index);
             }
 
             let buffer_slice = &buffer[buffer_index..buffer_index + SD_WORD_DIV];
@@ -1583,7 +1595,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Write for Sdio4bit<DMA_CH, P> {
             self.position += SD_WORD_DIV as u64;
             block_index += 1;
         }
-        
+
         // Lastly write all the bytes that don't align with words(again)
         let remaining = buffer.len() - buffer_index;
 
@@ -1592,9 +1604,9 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Write for Sdio4bit<DMA_CH, P> {
             // Check if the position is now outside of the working block,
             // and if so return with bytes written
             if block_index >= (SD_BLOCK_LEN / SD_WORD_DIV) {
-                return Ok(buffer_index)
+                return Ok(buffer_index);
             }
-            
+
             let mut shift: usize = 24;
 
             // Prepare a buffer word
@@ -1609,7 +1621,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Write for Sdio4bit<DMA_CH, P> {
                 buffer_index += 1;
                 self.position += 1;
             }
-           
+
             // Write the buffer word to the working block
             working_block[block_index] = buffer_word;
         }
@@ -1621,7 +1633,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Write for Sdio4bit<DMA_CH, P> {
         // If already in tx, we don't need to flush
         if self.is_tx() {
             self.wait_tx()?;
-            return Ok(())
+            return Ok(());
         }
 
         // Otherwise wait for the recieve to be finished
@@ -1654,8 +1666,10 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Seek for Sdio4bit<DMA_CH, P> {
             SeekFrom::Start(position) => {
                 self.position = position;
                 self.position
-            },
-            SeekFrom::End(position) => {todo!()}
+            }
+            SeekFrom::End(position) => {
+                todo!()
+            }
             SeekFrom::Current(delta) => {
                 self.position = ((self.position as i64) + delta) as u64;
                 self.position
@@ -1668,7 +1682,7 @@ impl<DMA_CH: SingleChannelDma, P: PIOExt> Seek for Sdio4bit<DMA_CH, P> {
 
         Ok(())
     }
-    
+
     fn stream_position(&mut self) -> Result<u64, MsBakerError> {
         Ok(self.position)
     }

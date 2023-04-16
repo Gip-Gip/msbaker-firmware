@@ -20,7 +20,6 @@ pio-proc = "0.2.0"
 pio = "0.2.0"
 snafu = { version = "0.7.4", default-features = false }
 arrayvec = { version = "0.7.2", default-features = false }
-rs-rws = { path="../rs-rws/" }
 
 [features]
 rt = ["rp2040-pac/rt"]
