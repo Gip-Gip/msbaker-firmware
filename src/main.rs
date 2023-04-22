@@ -25,6 +25,7 @@ mod sdio;
 
 use crate::sdio::Sdio4bit;
 
+use ape_mbr::{MBR, PartitionId};
 use rp2040_hal as hal;
 
 use core::panic::PanicInfo;
@@ -45,6 +46,7 @@ use core::fmt::Write as FmtWrite;
 
 use embedded_io::blocking::{Read, Seek, Write};
 use embedded_io::SeekFrom;
+use ape_fatfs::fs::{FileSystem, FsOptions};
 
 #[link_section = ".boot2"]
 #[used]
@@ -133,6 +135,19 @@ fn main_0() -> ! {
 
     sd_controller.init().unwrap();
 
+    // Initialize the filesystem on the sd card
+    let mut sd_mbr = MBR::new(sd_controller).unwrap();
+    let sd_p1 = sd_mbr.get_partition(PartitionId::One).unwrap();
+    let sd_fs = FileSystem::new(sd_p1, FsOptions::new()).unwrap();
+    let sd_root_dir = sd_fs.root_dir();
+
+    // Test file write
+    let mut file = sd_root_dir.create_file("foo.txt").unwrap();
+    file.write_all(b"Hello, World!").unwrap();
+    drop(file);
+    drop(sd_root_dir);
+    sd_fs.unmount().unwrap();
+
     // ===================================================================== //
     // STEP 1.1, SELF CHECKS!                                                //
     // ===================================================================== //
@@ -155,33 +170,6 @@ fn main_0() -> ! {
     // STEP 2, WAIT!                                                         //
     // ===================================================================== //
     // Turn the LED solid to signify all is good!
-
-    let clear: [u8; 256] = [0xFF; 256];
-
-    sd_controller.write_all(&clear);
-    sd_controller.rewind();
-
-    let hello = "Hello, World! I am doing well!".as_bytes();
-    let mut buf: [u8; 30] = [0; 30];
-
-    for i in 1..30 {
-        let hello_slice = &hello[..i];
-        let mut buf_slice = &mut buf[..i];
-
-        for _ in 0..256 {
-            sd_controller.write_all(hello_slice);
-        }
-
-        sd_controller.flush();
-        sd_controller.rewind();
-
-        for _ in 0..256 {
-            sd_controller.read_exact(&mut buf_slice).unwrap();
-            assert_eq!(buf_slice, hello_slice);
-        }
-
-        sd_controller.rewind();
-    }
 
     pin_led.set_high().unwrap();
 

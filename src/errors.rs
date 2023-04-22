@@ -61,6 +61,8 @@ pub enum MsBakerError {
     SdioCmdUnknownErr {},
     #[snafu(display("(PE)SDIO already transferring/recieving! Should definitely not happen!"))]
     SdioInTxRx {},
+    #[snafu(display("(IO) Unexpected EOF!"))]
+    IoUnexpectedEof {},
     #[snafu(display("Programmer Error!"))]
     PE {},
 }
@@ -74,5 +76,14 @@ impl Error for MsBakerError {
 impl From<MsBakerError> for ReadExactError<MsBakerError> {
     fn from(e: MsBakerError) -> ReadExactError<MsBakerError> {
         Self::Other(e)
+    }
+}
+
+impl From<ReadExactError<MsBakerError>> for MsBakerError {
+    fn from(e: ReadExactError<MsBakerError>) -> MsBakerError {
+        match e {
+            ReadExactError::UnexpectedEof => Self::IoUnexpectedEof {  },
+            ReadExactError::Other(e) => e,
+        }
     }
 }
