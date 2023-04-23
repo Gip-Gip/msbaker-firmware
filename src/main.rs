@@ -29,7 +29,7 @@ use ape_mbr::{MBR, PartitionId};
 use rp2040_hal as hal;
 
 use core::panic::PanicInfo;
-use hal::pac;
+use hal::{pac, Timer};
 
 use hal::dma::DMAExt;
 
@@ -65,7 +65,6 @@ fn main_0() -> ! {
     // STEP 1, INITIALIZATION!                                               //
     // ===================================================================== //
     let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
     let dma = pac.DMA.split(&mut pac.RESETS);
 
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
@@ -110,9 +109,10 @@ fn main_0() -> ! {
     let pin_sd_clk = pins.gpio0.into_mode::<hal::gpio::FunctionPio0>();
     let pin_sd_cmd = pins.gpio5.into_mode::<hal::gpio::FunctionPio0>();
     let pin_sd_dat0 = pins.gpio1.into_mode::<hal::gpio::FunctionPio0>();
-    let pin_sd_dat1 = pins.gpio2.into_mode::<hal::gpio::FunctionPio0>();
-    let pin_sd_dat2 = pins.gpio3.into_mode::<hal::gpio::FunctionPio0>();
-    let pin_sd_dat3 = pins.gpio4.into_mode::<hal::gpio::FunctionPio0>();
+    // Unused but still required
+    let _pin_sd_dat1 = pins.gpio2.into_mode::<hal::gpio::FunctionPio0>();
+    let _pin_sd_dat2 = pins.gpio3.into_mode::<hal::gpio::FunctionPio0>();
+    let _pin_sd_dat3 = pins.gpio4.into_mode::<hal::gpio::FunctionPio0>();
 
     // Get their ids
     let pin_sd_clk_id = pin_sd_clk.id().num;
@@ -120,12 +120,12 @@ fn main_0() -> ! {
     let pin_sd_dat0_id = pin_sd_dat0.id().num;
 
     // Initialize the sd card
-    let (mut pio, sm0, sm1, _, _) = pac.PIO0.split(&mut pac.RESETS);
-    let mut delay = Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let (pio, sm0, sm1, _, _) = pac.PIO0.split(&mut pac.RESETS);
+    let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
     let mut sd_controller = Sdio4bit::new(
         pio,
         dma.ch0,
-        delay,
+        &timer,
         sm0,
         sm1,
         pin_sd_clk_id,
@@ -139,14 +139,7 @@ fn main_0() -> ! {
     let mut sd_mbr = MBR::new(sd_controller).unwrap();
     let sd_p1 = sd_mbr.get_partition(PartitionId::One).unwrap();
     let sd_fs = FileSystem::new(sd_p1, FsOptions::new()).unwrap();
-    let sd_root_dir = sd_fs.root_dir();
-
-    // Test file write
-    let mut file = sd_root_dir.create_file("foo.txt").unwrap();
-    file.write_all(b"Hello, World!").unwrap();
-    drop(file);
-    drop(sd_root_dir);
-    sd_fs.unmount().unwrap();
+    //let sd_root_dir = sd_fs.root_dir();
 
     // ===================================================================== //
     // STEP 1.1, SELF CHECKS!                                                //
@@ -183,7 +176,7 @@ fn main_1() {
     todo!()
 }
 
-static xmorse: [u8; 256] = [
+static XMORSE: [u8; 256] = [
     67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 12, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
     90, 91, 92, 93, 94, 95, 96, 97, 0, 35, 65, 98, 99, 100, 66, 24, 58, 59, 101, 102, 17, 36, 15,
     103, 104, 64, 105, 106, 107, 108, 109, 110, 111, 112, 62, 33, 113, 114, 115, 32, 116, 30, 37,
@@ -204,7 +197,7 @@ fn panic(panic_info: &PanicInfo) -> ! {
     unsafe {
         let mut message_string = ArrayString::<256>::new();
 
-        write!(&mut message_string, "{}", panic_info);
+        write!(&mut message_string, "{}", panic_info).unwrap_unchecked();
 
         let message = &message_string;
 
@@ -242,23 +235,23 @@ fn panic(panic_info: &PanicInfo) -> ! {
         loop {
             // Flash it at 4hz
             for _ in 0..4 * 10 {
-                pin_led.set_high();
+                pin_led.set_high().unwrap_unchecked();
                 delay.delay_ms(125);
-                pin_led.set_low();
+                pin_led.set_low().unwrap_unchecked();
                 delay.delay_ms(125);
             }
 
             delay.delay_ms(1000);
             for byte in message.as_bytes() {
-                let mut byte: u8 = xmorse[*byte as usize];
+                let mut byte: u8 = XMORSE[*byte as usize];
                 // Flash quick twice to indicate new byte
-                pin_led.set_high();
+                pin_led.set_high().unwrap_unchecked();
                 delay.delay_ms(125);
-                pin_led.set_low();
+                pin_led.set_low().unwrap_unchecked();
                 delay.delay_ms(125);
-                pin_led.set_high();
+                pin_led.set_high().unwrap_unchecked();
                 delay.delay_ms(125);
-                pin_led.set_low();
+                pin_led.set_low().unwrap_unchecked();
                 delay.delay_ms(1000);
 
                 while byte > 0 {
@@ -266,9 +259,9 @@ fn panic(panic_info: &PanicInfo) -> ! {
                         true => 125,
                         false => 500,
                     };
-                    pin_led.set_high();
+                    pin_led.set_high().unwrap_unchecked();
                     delay.delay_ms(delaytime);
-                    pin_led.set_low();
+                    pin_led.set_low().unwrap_unchecked();
                     delay.delay_ms(1000 - delaytime);
                     byte >>= 1;
                 }

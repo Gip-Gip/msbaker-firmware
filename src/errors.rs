@@ -6,11 +6,11 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 pub enum MsBakerError {
     #[snafu(display("(SDIO) Timeout on SD command!"))]
-    SdioCmdTimeout { cmd: u8, timeout_time: u32 },
+    SdioCmdTimeout { },
     #[snafu(display("(SDIO) Timeout on write!"))]
     SdioWriteTimeout {},
     #[snafu(display("(SDIO) Response is to the wrong command!"))]
-    SdioWrongCmd { good_cmd: u8, bad_cmd: u8 },
+    SdioWrongCmd { },
     #[snafu(display("(SDIO) Bad rx CRC7!"))]
     SdioBadRxCrc7 {},
     #[snafu(display("(SDIO) Bad tx CRC7!"))]
