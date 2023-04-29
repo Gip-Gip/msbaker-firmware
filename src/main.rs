@@ -21,20 +21,26 @@
 #![no_main]
 
 mod errors;
-mod sdio;
 
-use crate::sdio::Sdio4bit;
+use hal::gpio::{Function, Pin, FunctionI2C};
+use hal::gpio::bank0::{Gpio6, Gpio7};
+use hal::multicore::{Stack, Multicore};
+use hal::sio::Spinlock30;
+use hal::timer::Alarm;
+use pac::I2C1;
+use rp_sdio::sdio::Sdio4bit;
 
-use ape_mbr::{MBR, PartitionId};
+use ape_mbr::{MBR, PartitionId, Partition};
 use rp2040_hal as hal;
 
 use core::panic::PanicInfo;
-use hal::{pac, Timer};
+use core::time::Duration;
+use hal::{pac, Timer, I2C};
 
-use hal::dma::DMAExt;
+use hal::dma::{DMAExt, Channel, CH0};
 
 use embedded_hal::blocking::i2c::WriteRead;
-use fugit::RateExtU32;
+use fugit::{RateExtU32, MicrosDurationU32};
 use hal::pio::PIOExt;
 
 use cortex_m::delay::Delay;
@@ -57,7 +63,19 @@ const IMU_ADDR: u8 = 0b1101010;
 const IMU_CHECK_REG: u8 = 0x0F;
 const IMU_CHECK_VAL: u8 = 0b01101100;
 
+static mut CORE1_STACK: Stack<4096> = Stack::new();
+
+// SIO Command Constants
+
+const SIO_CMD_READY: u32 = 0x00;
+const SIO_CMD_PANIC: u32 = 0x01;
+const SIO_CMD_TELEM: u32 = 0x02;
+
 /// Core 0 main function, the entrypoint for our code
+/// 
+/// Core 0 is in charge of starting core 1 and output. Ouput in the case of
+/// base Ms. Baker being SD card I/O and turning the status LED green
+///
 /// Everything starts here!
 #[rp2040_hal::entry]
 fn main_0() -> ! {
@@ -69,6 +87,15 @@ fn main_0() -> ! {
 
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
 
+    let mut sio = hal::Sio::new(pac.SIO);
+
+    let pins = hal::gpio::Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
+    
     let clocks = hal::clocks::init_clocks_and_plls(
         XTAL_FREQ_HZ,
         pac.XOSC,
@@ -81,17 +108,9 @@ fn main_0() -> ! {
     .ok()
     .unwrap();
 
-    let sio = hal::Sio::new(pac.SIO);
-
-    let pins = hal::gpio::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
-
     // Initialize GPIO
     let mut pin_led = pins.gpio25.into_push_pull_output();
+
     // Initialize the I2C1 line
     // !TODO! says it's I2C0 on the schematic, figure out why
     let pin_i2c1_sda = pins.gpio6.into_mode::<hal::gpio::FunctionI2C>();
@@ -120,10 +139,11 @@ fn main_0() -> ! {
     let pin_sd_dat0_id = pin_sd_dat0.id().num;
 
     // Initialize the sd card
-    let (pio, sm0, sm1, _, _) = pac.PIO0.split(&mut pac.RESETS);
-    let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
+    let (mut pio, sm0, sm1, _, _) = pac.PIO0.split(&mut pac.RESETS);
+    let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS);
+    let mut alarm_2 = timer.alarm_2().unwrap();
     let mut sd_controller = Sdio4bit::new(
-        pio,
+        &mut pio,
         dma.ch0,
         &timer,
         sm0,
@@ -131,19 +151,105 @@ fn main_0() -> ! {
         pin_sd_clk_id,
         pin_sd_cmd_id,
         pin_sd_dat0_id,
+        2
     );
 
     sd_controller.init().unwrap();
 
-    // Initialize the filesystem on the sd card
+    // Initilaize the filesystem on the SD card
+
     let mut sd_mbr = MBR::new(sd_controller).unwrap();
     let sd_p1 = sd_mbr.get_partition(PartitionId::One).unwrap();
+
     let sd_fs = FileSystem::new(sd_p1, FsOptions::new()).unwrap();
-    //let sd_root_dir = sd_fs.root_dir();
+
+    let sd_root = sd_fs.root_dir();
+
+    let mut log_file = sd_root.create_file("DATA.RDD").unwrap();
 
     // ===================================================================== //
-    // STEP 1.1, SELF CHECKS!                                                //
+    // STEP 2, START CORE 1                                                  //
     // ===================================================================== //
+    
+    let mut mc = Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
+
+    let cores = mc.cores();
+
+    let core1 = &mut cores[1];
+
+    core1.spawn(unsafe { &mut CORE1_STACK.mem }, move || {main_1(i2c1)}).unwrap();
+
+    // Wait on the second core to ready up...
+    
+    let response = sio.fifo.read_blocking();
+
+    match response {
+        SIO_CMD_READY => {},
+        SIO_CMD_PANIC => {halt()}, // If the other core has panic'd, do nothing
+        _ => {
+            panic!("Invalid response from core 1!");
+        }
+    }
+
+    // Turn the LED solid to signify all is good!
+    pin_led.set_high().unwrap();
+
+    let mut commands_processed: u64 = 0;
+    loop {
+        // Wait for commands from core 1
+        let command = sio.fifo.read_blocking();
+
+        // Set the sleep alarm
+        alarm_2.schedule(MicrosDurationU32::micros(1000)).unwrap();
+
+        match command {
+            SIO_CMD_PANIC => {halt()},
+            SIO_CMD_TELEM => {
+                log_file.write_all(b"B").unwrap();
+            }
+            _ => {
+                panic!("Invalid response from core 1!");
+            }
+        }
+
+
+        // Every 512 commands flush the file
+        commands_processed += 1;
+
+        if (commands_processed % 512) == 0 {
+            log_file.flush().unwrap();
+        }
+
+        // Wait for the sleep timer to finsh
+        cortex_m::asm::wfe();
+        while !alarm_2.finished() {}
+    }
+}
+
+/// Core 1 main function, called by core 0
+///
+/// Handles input from the IMU and keeps track of the rocket's position
+///
+/// Brain of the operation
+///
+/// Uses alarm 3 for timing
+fn main_1(
+    mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)>
+) -> ! {
+    // ===================================================================== //
+    // STEP 1, INITIALIZATION!                                               //
+    // ===================================================================== //
+    
+    // !SAFETY! Core 0 has finished initialization, and the following I/Os
+    // are exclusively allocated to core 1(supplied through the i2c argument):
+    //
+    //  * I2C1_SDA
+    //  * I2C1_SCL
+    
+    let mut pac = unsafe { pac::Peripherals::steal() };
+    let mut sio = hal::Sio::new(pac.SIO);
+
+    let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS);
 
     // Check the IMU
     let mut response: [u8; 1] = [0; 1];
@@ -155,25 +261,26 @@ fn main_0() -> ! {
         panic!("IMU NOT OK");
     }
 
-    // !TODO! Self check for sd card
+    // Notify the first core we are good!
+    sio.fifo.write_blocking(SIO_CMD_READY);
 
-    // !TODO! Initialize core 1
-
-    // ===================================================================== //
-    // STEP 2, WAIT!                                                         //
-    // ===================================================================== //
-    // Turn the LED solid to signify all is good!
-
-    pin_led.set_high().unwrap();
+    let mut alarm_3 = timer.alarm_3().unwrap();
 
     loop {
-        cortex_m::asm::wfi();
+        alarm_3.schedule(MicrosDurationU32::micros(1000)).unwrap();
+
+        sio.fifo.write_blocking(SIO_CMD_TELEM);
+
+        // Wait for the sleep timer to finish
+        cortex_m::asm::wfe();
+        while !alarm_3.finished() {}
     }
 }
 
-/// Core 1 main function, called by core 0
-fn main_1() {
-    todo!()
+fn halt() -> ! {
+    loop {
+        cortex_m::asm::wfi();
+    }
 }
 
 static XMORSE: [u8; 256] = [
@@ -194,6 +301,9 @@ static XMORSE: [u8; 256] = [
 
 #[panic_handler]
 fn panic(panic_info: &PanicInfo) -> ! {
+    // Panicing uses Spinlock30
+
+    let _lock = Spinlock30::claim();
     unsafe {
         let mut message_string = ArrayString::<256>::new();
 
@@ -218,7 +328,7 @@ fn panic(panic_info: &PanicInfo) -> ! {
         .ok()
         .unwrap();
 
-        let sio = hal::Sio::new(pac.SIO);
+        let mut sio = hal::Sio::new(pac.SIO);
 
         let pins = hal::gpio::Pins::new(
             pac.IO_BANK0,
@@ -226,6 +336,10 @@ fn panic(panic_info: &PanicInfo) -> ! {
             sio.gpio_bank0,
             &mut pac.RESETS,
         );
+
+        // Notify the other core we are panicing
+        
+        sio.fifo.write(SIO_CMD_PANIC);
 
         // Initialize GPIO
         let mut pin_led = pins.gpio25.into_push_pull_output();
