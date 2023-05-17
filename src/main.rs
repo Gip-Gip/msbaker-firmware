@@ -22,28 +22,32 @@
 
 mod errors;
 
-use ape_table_trig::{trig_table_gen_f32, TrigTableF32, abs_f32};
+use ape_table_trig::{abs_f32, trig_table_gen_f32, TrigTableF32};
 use bytemuck::{bytes_of, bytes_of_mut};
 use cortex_m::prelude::_embedded_hal_blocking_i2c_Write;
-use hal::gpio::{Function, Pin, FunctionI2C};
 use hal::gpio::bank0::{Gpio6, Gpio7};
-use hal::multicore::{Stack, Multicore};
-use hal::sio::{Spinlock30, Spinlock29};
+use hal::gpio::{Function, FunctionI2C, Pin};
+use hal::multicore::{Multicore, Stack};
+use hal::sio::{Spinlock29, Spinlock30};
 use hal::timer::{Alarm, Instant};
 use libm::atan2f;
 use pac::I2C1;
 use rp_sdio::sdio::Sdio4bit;
 
-use ape_mbr::{MBR, PartitionId, Partition};
+use ape_mbr::{Partition, PartitionId, MBR};
 use rp2040_hal as hal;
 
 use core::panic::PanicInfo;
+use core::str::FromStr;
 use hal::{pac, Timer, I2C};
 
-use hal::dma::{DMAExt, Channel, CH0};
+use hal::dma::{Channel, DMAExt, CH0};
 
 use embedded_hal::blocking::i2c::WriteRead;
-use fugit::{RateExtU32, MicrosDurationU32, SecsDurationU64, MicrosDurationU64, MicrosDuration, TimerInstantU64};
+use fugit::{
+    MicrosDuration, MicrosDurationU32, MicrosDurationU64, RateExtU32, SecsDurationU64,
+    TimerInstantU64,
+};
 use hal::pio::PIOExt;
 
 use cortex_m::delay::Delay;
@@ -53,8 +57,8 @@ use rp2040_hal::clocks::Clock;
 use arrayvec::ArrayString;
 use core::fmt::Write as FmtWrite;
 
-use embedded_io::blocking::{Write};
 use ape_fatfs::fs::{FileSystem, FsOptions};
+use embedded_io::blocking::Write;
 
 #[link_section = ".boot2"]
 #[used]
@@ -99,7 +103,7 @@ const ZERO_THRESH: f32 = 0.1; // Threshold to zero a heading.Prevents gymbal loc
 const TRIG_TBL: [f32; 20571] = trig_table_gen_f32!(20571);
 
 /// Core 0 main function, the entrypoint for our code
-/// 
+///
 /// Core 0 is in charge of starting core 1 and output. Ouput in the case of
 /// base Ms. Baker being SD card I/O and turning the status LED green
 ///
@@ -123,7 +127,7 @@ fn main_0() -> ! {
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
-    
+
     let clocks = hal::clocks::init_clocks_and_plls(
         XTAL_FREQ_HZ,
         pac.XOSC,
@@ -178,7 +182,7 @@ fn main_0() -> ! {
         pin_sd_clk_id,
         pin_sd_cmd_id,
         pin_sd_dat0_id,
-        1
+        1,
     );
 
     sd_controller.init().unwrap();
@@ -192,12 +196,26 @@ fn main_0() -> ! {
 
     let sd_root = sd_fs.root_dir();
 
-    let mut log_file = sd_root.create_file("DATA.RDD").unwrap();
+    // Create a name for the log file. Needs to not exist.
+    // All files use the 8.3 DOS filename, as far as we are concerned
+    let mut name_string = ArrayString::<12>::from_str("LOG").unwrap();
+
+    for i in 0..u16::MAX {
+        write!(&mut name_string, "{}.RDD", i).unwrap();
+
+        if !sd_root.exists(&name_string).unwrap() {
+            break;
+        }
+
+        name_string.truncate(3);
+    }
+
+    let mut log_file = sd_root.create_file(&name_string).unwrap();
 
     // ===================================================================== //
     // STEP 2, START CORE 1                                                  //
     // ===================================================================== //
-    
+
     // First, alert the user to **NOT** touch the computer when core 1 is started.
     //
     // Core 1 will calculate it's heading and calibrate gravity based on the accelerations
@@ -205,8 +223,8 @@ fn main_0() -> ! {
     // the calibration procedure.
     //
     // Blink 5 times giving a 5 second heads up to the end user.
-    // Temporarily use a delay for code ease of use, then immediately drop it.
-    
+    // Temporarily use a delay for coding ease of use, then immediately drop it.
+
     let mut delay = Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
     for _ in 0..5 {
@@ -219,22 +237,24 @@ fn main_0() -> ! {
     drop(delay);
 
     // Create the multicore instance
-    
+
     let mut mc = Multicore::new(&mut pac.PSM, &mut pac.PPB, &mut sio.fifo);
 
     let cores = mc.cores();
 
     let core1 = &mut cores[1];
 
-    core1.spawn(unsafe { &mut CORE1_STACK.mem }, move || {main_1(i2c1)}).unwrap();
+    core1
+        .spawn(unsafe { &mut CORE1_STACK.mem }, move || main_1(i2c1))
+        .unwrap();
 
     // Wait on the second core to ready up...
-    
+
     let response = sio.fifo.read_blocking();
 
     match response {
-        SIO_CMD_READY => {},
-        SIO_CMD_PANIC => {halt()}, // If the other core has panic'd, do nothing
+        SIO_CMD_READY => {}
+        SIO_CMD_PANIC => halt(), // If the other core has panic'd, do nothing
         _ => {
             panic!("Invalid response from core 1!");
         }
@@ -244,7 +264,7 @@ fn main_0() -> ! {
     pin_led.set_high().unwrap();
 
     // ===================================================================== //
-    // EXECUTION LOOP                                                        // 
+    // EXECUTION LOOP                                                        //
     // ===================================================================== //
     let mut commands_processed: u64 = 0;
     let mut loop_duration_us: u32 = 0; // Duration of the previous execution loop in us
@@ -259,12 +279,12 @@ fn main_0() -> ! {
         cortex_m::asm::wfe();
 
         let start_time = timer.get_counter(); // Start time of this execution loop
-        // Wait for commands from core 1
+                                              // Wait for commands from core 1
         if data_left == 0 {
             let command = sio.fifo.read_blocking();
 
             match command {
-                SIO_CMD_PANIC => {halt()},
+                SIO_CMD_PANIC => halt(),
                 SIO_CMD_TELEM => {
                     let core_1_loop_duration_us = sio.fifo.read_blocking();
                     let time = sio.fifo.read_blocking();
@@ -310,19 +330,21 @@ fn main_0() -> ! {
                         imu_accel_z_ms2,
                         acceleration_x_ms2,
                         acceleration_y_ms2,
-                        acceleration_z_ms2
+                        acceleration_z_ms2,
                     ];
 
-                    data_left = (22*4) - log_file.write(&bytes_of(&out_data)).unwrap();
-                },
+                    data_left = (22 * 4) - log_file.write(&bytes_of(&out_data)).unwrap();
+                }
                 _ => {
                     panic!("Invalid response from core 1!");
-                },
+                }
             }
         } else {
-            data_left = data_left - log_file.write(&bytes_of(&out_data)[(22*4) - data_left..]).unwrap();
+            data_left = data_left
+                - log_file
+                    .write(&bytes_of(&out_data)[(22 * 4) - data_left..])
+                    .unwrap();
         }
-
 
         // Every 1000 commands flush the file
         commands_processed += 1;
@@ -330,8 +352,12 @@ fn main_0() -> ! {
         if (commands_processed % 1000) == 0 {
             log_file.flush().unwrap();
         }
-        
-        loop_duration_us = timer.get_counter().checked_duration_since(start_time).unwrap().to_micros() as u32; 
+
+        loop_duration_us = timer
+            .get_counter()
+            .checked_duration_since(start_time)
+            .unwrap()
+            .to_micros() as u32;
         // Tell core 1 we are ready for more data!
         if data_left == 0 {
             sio.fifo.write_blocking(SIO_CMD_READY);
@@ -346,19 +372,17 @@ fn main_0() -> ! {
 /// Brain of the operation
 ///
 /// Uses alarm 3 for timing
-fn main_1(
-    mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)>
-) -> ! {
+fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)>) -> ! {
     // ===================================================================== //
     // STEP 1, INITIALIZATION!                                               //
     // ===================================================================== //
-    
+
     // !SAFETY! Core 0 has finished initialization, and the following I/Os
     // are exclusively allocated to core 1(supplied through the i2c argument):
     //
     //  * I2C1_SDA
     //  * I2C1_SCL
-    
+
     let mut pac = unsafe { pac::Peripherals::steal() };
     let mut sio = hal::Sio::new(pac.SIO);
 
@@ -379,18 +403,18 @@ fn main_1(
     // Configure the IMU to have an initial sensitivity of +- 4g and a refresh
     // rate of 1.66kHz
     i2c1.write(IMU_ADDR, &IMU_CFG).unwrap();
-    
+
     // ===================================================================== //
     // STEP 1.1, HEADING CALCULATION                                         //
     // ===================================================================== //
-    
+
     // First we need to get a good average of the acceleration experienced by
     // each axis, about 1 second worth of readings
 
     let mut imu_accel_x_ms2: f32 = 0.0; // Acceleration in the X plane, in m/s^2. Relative to IMU
     let mut imu_accel_y_ms2: f32 = 0.0; // Acceleration in the Y plane, in m/s^2. Relative to IMU
     let mut imu_accel_z_ms2: f32 = 0.0; // Acceleration in the Z plane, in m/s^2. Relative to IMU
-    
+
     const SAMPLE_COUNT: usize = 1000;
     for _ in 0..SAMPLE_COUNT {
         // Schedule the alarm
@@ -399,10 +423,11 @@ fn main_1(
         // Gather telemetry
 
         let mut read_buffer: [i16; 3] = [0; 3]; // All the registers needed to be read
-                                             // occupy 14 bytes, 7 half-words
+                                                // occupy 14 bytes, 7 half-words
 
         let read_buffer_bytes = bytes_of_mut(&mut read_buffer);
-        i2c1.write_read(IMU_ADDR, &[IMU_ACCEL_REG], read_buffer_bytes).unwrap();
+        i2c1.write_read(IMU_ADDR, &[IMU_ACCEL_REG], read_buffer_bytes)
+            .unwrap();
 
         // Move the registers into variables
         let imu_accel_x_raw = read_buffer[0];
@@ -410,9 +435,12 @@ fn main_1(
         let imu_accel_z_raw = read_buffer[2];
 
         // Average out the newly aquired acclerations(using the default acceleration multiplier)
-        imu_accel_x_ms2 += (imu_accel_x_raw as f32) * IMU_ACCEL_MULT_4G * (1.0 / (SAMPLE_COUNT as f32));
-        imu_accel_y_ms2 += (imu_accel_y_raw as f32) * IMU_ACCEL_MULT_4G * (1.0 / (SAMPLE_COUNT as f32));
-        imu_accel_z_ms2 += (imu_accel_z_raw as f32) * IMU_ACCEL_MULT_4G * (1.0 / (SAMPLE_COUNT as f32));
+        imu_accel_x_ms2 +=
+            (imu_accel_x_raw as f32) * IMU_ACCEL_MULT_4G * (1.0 / (SAMPLE_COUNT as f32));
+        imu_accel_y_ms2 +=
+            (imu_accel_y_raw as f32) * IMU_ACCEL_MULT_4G * (1.0 / (SAMPLE_COUNT as f32));
+        imu_accel_z_ms2 +=
+            (imu_accel_z_raw as f32) * IMU_ACCEL_MULT_4G * (1.0 / (SAMPLE_COUNT as f32));
 
         //if !alarm_3.finished() {cortex_m::asm::wfe();}
         //while !alarm_3.finished() {}
@@ -435,25 +463,22 @@ fn main_1(
     let sin_x = trig.sin(-heading_x_r);
     let sin_y = trig.sin(-heading_y_r);
     let sin_z = trig.sin(-heading_z_r);
-    
+
     let cos_x = trig.cos(-heading_x_r);
     let cos_y = trig.cos(-heading_y_r);
     let cos_z = trig.cos(-heading_z_r);
-    
+
     // Acceleration across the X is affected by Y and Z heading
-    let mut acceleration_x_ms2 = sin_y * imu_accel_z_ms2  + cos_y * (
-        cos_z * imu_accel_x_ms2 - sin_z * imu_accel_y_ms2
-    );
+    let mut acceleration_x_ms2 =
+        sin_y * imu_accel_z_ms2 + cos_y * (cos_z * imu_accel_x_ms2 - sin_z * imu_accel_y_ms2);
 
     // Acceleration across the Y is affected by X and Z heading
-    let mut acceleration_y_ms2 = sin_z * imu_accel_x_ms2 + cos_z * (
-        cos_x * imu_accel_y_ms2 - sin_x * imu_accel_z_ms2
-    );
+    let mut acceleration_y_ms2 =
+        sin_z * imu_accel_x_ms2 + cos_z * (cos_x * imu_accel_y_ms2 - sin_x * imu_accel_z_ms2);
 
     // Acceleration across the Z is affected by X and Y heading
-    let mut acceleration_z_ms2 = sin_x * imu_accel_y_ms2 + cos_x * (
-        cos_y * imu_accel_z_ms2 - sin_y * imu_accel_x_ms2
-    );
+    let mut acceleration_z_ms2 =
+        sin_x * imu_accel_y_ms2 + cos_x * (cos_y * imu_accel_z_ms2 - sin_y * imu_accel_x_ms2);
 
     // Calibrate to gravity
     let accel_adjust = GRAVITY_MS2 / acceleration_z_ms2;
@@ -462,14 +487,14 @@ fn main_1(
     acceleration_x_ms2 *= accel_adjust;
     acceleration_y_ms2 *= accel_adjust;
     acceleration_z_ms2 *= accel_adjust;
-    
+
     // Subtract gravity from the Z acceleration
     acceleration_z_ms2 -= GRAVITY_MS2;
 
     // ===================================================================== //
-    // EXECUTION LOOP                                                        // 
+    // EXECUTION LOOP                                                        //
     // ===================================================================== //
-    
+
     // Notify the first core we are good!
     sio.fifo.write_blocking(SIO_CMD_READY);
 
@@ -486,7 +511,7 @@ fn main_1(
     let mut rate_x_rs: f32 = 0.0; // Angular rate along the X axis in r/s
     let mut rate_y_rs: f32 = 0.0; // Angular rate along the Y axis in r/s
     let mut rate_z_rs: f32 = 0.0; // Angular rate along the Z axis in r/s
-    
+
     // Math variables
     // With the default 4g range we have a sensitivity of 0.122 mg/LSB which
     // shall be converted to m/s^2
@@ -502,38 +527,58 @@ fn main_1(
         // Schedule the alarm
         alarm_3.schedule(MicrosDurationU32::micros(1000)).unwrap();
         let start_time = timer.get_counter(); // Start time of this execution loop
-        // Send an event to core 0 to wake it up
+                                              // Send an event to core 0 to wake it up
         cortex_m::asm::sev();
 
         // Send everything to core 0 to be written to the SD card, if it is ready
-        
+
         if let Some(cmd) = sio.fifo.read() {
             match cmd {
                 SIO_CMD_READY => {
                     sio.fifo.write_blocking(SIO_CMD_TELEM);
                     sio.fifo.write_blocking(loop_duration_us);
-                    sio.fifo.write_blocking(u32::from_ne_bytes(time.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(temperature_imu_c.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(position_x_m.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(position_y_m.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(position_z_m.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(heading_x_r.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(heading_y_r.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(heading_z_r.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(velocity_x_ms.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(velocity_y_ms.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(velocity_z_ms.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(rate_x_rs.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(rate_y_rs.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(rate_z_rs.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(imu_accel_x_ms2.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(imu_accel_y_ms2.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(imu_accel_z_ms2.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(acceleration_x_ms2.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(acceleration_y_ms2.to_ne_bytes()));
-                    sio.fifo.write_blocking(u32::from_ne_bytes(acceleration_z_ms2.to_ne_bytes()));
-                },
-                SIO_CMD_PANIC => {halt()},
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(time.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(temperature_imu_c.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(position_x_m.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(position_y_m.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(position_z_m.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(heading_x_r.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(heading_y_r.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(heading_z_r.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(velocity_x_ms.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(velocity_y_ms.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(velocity_z_ms.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(rate_x_rs.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(rate_y_rs.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(rate_z_rs.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(imu_accel_x_ms2.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(imu_accel_y_ms2.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(imu_accel_z_ms2.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(acceleration_x_ms2.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(acceleration_y_ms2.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(acceleration_z_ms2.to_ne_bytes()));
+                }
+                SIO_CMD_PANIC => halt(),
                 _ => {
                     panic!("Invalid response from core 0!");
                 }
@@ -542,10 +587,11 @@ fn main_1(
         // Gather telemetry
 
         let mut read_buffer: [i16; 7] = [0; 7]; // All the registers needed to be read
-                                             // occupy 14 bytes, 7 half-words
+                                                // occupy 14 bytes, 7 half-words
 
         let read_buffer_bytes = bytes_of_mut(&mut read_buffer);
-        i2c1.write_read(IMU_ADDR, &[IMU_TELM_REG], read_buffer_bytes).unwrap();
+        i2c1.write_read(IMU_ADDR, &[IMU_TELM_REG], read_buffer_bytes)
+            .unwrap();
 
         // Move the registers into variables
         let temperature_imu_raw = read_buffer[0];
@@ -558,29 +604,25 @@ fn main_1(
         let imu_accel_y_raw = read_buffer[5];
         let imu_accel_z_raw = read_buffer[6];
 
-
-
         // Convert the raw variables into the actual telemetry variables we need
         let prev_time = time;
 
         // Convert the micros to seconds
-        time = ((start_time.checked_duration_since(epoch).unwrap().to_micros()) as f32) * 1e-6;
-
+        time = ((start_time
+            .checked_duration_since(epoch)
+            .unwrap()
+            .to_micros()) as f32)
+            * 1e-6;
 
         temperature_imu_c = (temperature_imu_raw as f32) * IMU_TEMP_MULT;
 
         rate_x_rs = (rate_x_raw as f32) * rate_multiplier;
         rate_y_rs = (rate_y_raw as f32) * rate_multiplier;
         rate_z_rs = (rate_z_raw as f32) * rate_multiplier;
-        
+
         imu_accel_x_ms2 = (imu_accel_x_raw as f32) * imu_accel_multiplier;
         imu_accel_y_ms2 = (imu_accel_y_raw as f32) * imu_accel_multiplier;
         imu_accel_z_ms2 = (imu_accel_z_raw as f32) * imu_accel_multiplier;
-
-
-
-
-
 
         // Compute everyting else
         let time_delta = time - prev_time;
@@ -593,31 +635,26 @@ fn main_1(
         heading_y_r += heading_delta_y_r;
         heading_z_r += heading_delta_z_r;
 
-
-
         // Rotate all the accelerations to match the coordinate system's axies
         let sin_x = trig.sin(-heading_x_r);
         let sin_y = trig.sin(-heading_y_r);
         let sin_z = trig.sin(-heading_z_r);
-        
+
         let cos_x = trig.cos(-heading_x_r);
         let cos_y = trig.cos(-heading_y_r);
         let cos_z = trig.cos(-heading_z_r);
 
         // Acceleration across the X is affected by Y and Z heading
-        acceleration_x_ms2 = sin_y * imu_accel_z_ms2  + cos_y * (
-            cos_z * imu_accel_x_ms2 - sin_z * imu_accel_y_ms2
-        );
+        acceleration_x_ms2 =
+            sin_y * imu_accel_z_ms2 + cos_y * (cos_z * imu_accel_x_ms2 - sin_z * imu_accel_y_ms2);
 
         // Acceleration across the Y is affected by X and Z heading
-        acceleration_y_ms2 = sin_z * imu_accel_x_ms2 + cos_z * (
-            cos_x * imu_accel_y_ms2 - sin_x * imu_accel_z_ms2
-        );
+        acceleration_y_ms2 =
+            sin_z * imu_accel_x_ms2 + cos_z * (cos_x * imu_accel_y_ms2 - sin_x * imu_accel_z_ms2);
 
         // Acceleration across the Z is affected by X and Y heading
-        acceleration_z_ms2 = sin_x * imu_accel_y_ms2 + cos_x * (
-            cos_y * imu_accel_z_ms2 - sin_y * imu_accel_x_ms2
-        );
+        acceleration_z_ms2 =
+            sin_x * imu_accel_y_ms2 + cos_x * (cos_y * imu_accel_z_ms2 - sin_y * imu_accel_x_ms2);
 
         // Multiply all accelerations by accel adjust
         acceleration_x_ms2 *= accel_adjust;
@@ -627,7 +664,6 @@ fn main_1(
         // Subtract gravity from the Z acceleration
         acceleration_z_ms2 -= GRAVITY_MS2;
 
-        
         // Calculate new coordinates given accelerations
         // D = vt + 0.5at^2
         let time_delta_sqrd_hlvd = time_delta * time_delta * 0.5;
@@ -639,13 +675,17 @@ fn main_1(
         velocity_x_ms += acceleration_x_ms2 * time_delta;
         velocity_y_ms += acceleration_y_ms2 * time_delta;
         velocity_z_ms += acceleration_z_ms2 * time_delta;
-    
-
 
         // Store the loop time to the previous time variable
-        loop_duration_us = timer.get_counter().checked_duration_since(start_time).unwrap().to_micros() as u32; 
+        loop_duration_us = timer
+            .get_counter()
+            .checked_duration_since(start_time)
+            .unwrap()
+            .to_micros() as u32;
         // Wait for the sleep timer to finish
-        if !alarm_3.finished() {cortex_m::asm::wfe();}
+        if !alarm_3.finished() {
+            cortex_m::asm::wfe();
+        }
         while !alarm_3.finished() {}
     }
 }
@@ -711,7 +751,7 @@ fn panic(panic_info: &PanicInfo) -> ! {
         );
 
         // Notify the other core we are panicing
-        
+
         sio.fifo.write(SIO_CMD_PANIC);
 
         // Initialize GPIO
