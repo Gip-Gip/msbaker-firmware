@@ -21,8 +21,9 @@
 #![no_main]
 
 mod errors;
+mod vectors;
 
-use ape_table_trig::{abs_f32, trig_table_gen_f32, TrigTableF32};
+use ape_table_trig::{abs_f32, trig_table_gen_f32, TrigTableF32, QUART_CIRC_F32};
 use bytemuck::{bytes_of, bytes_of_mut};
 use cortex_m::prelude::_embedded_hal_blocking_i2c_Write;
 use hal::gpio::bank0::{Gpio6, Gpio7};
@@ -30,7 +31,7 @@ use hal::gpio::{Function, FunctionI2C, Pin};
 use hal::multicore::{Multicore, Stack};
 use hal::sio::{Spinlock29, Spinlock30};
 use hal::timer::{Alarm, Instant};
-use libm::atan2f;
+use nalgebra::Vector3;
 use pac::I2C1;
 use rp_sdio::sdio::Sdio4bit;
 
@@ -59,6 +60,8 @@ use core::fmt::Write as FmtWrite;
 
 use ape_fatfs::fs::{FileSystem, FsOptions};
 use embedded_io::blocking::Write;
+
+use crate::vectors::{initial_unit_quaternions, multi_rotate};
 
 #[link_section = ".boot2"]
 #[used]
@@ -90,17 +93,17 @@ const IMU_TELM_REG: u8 = 0x20;
 const IMU_ACCEL_REG: u8 = 0x28;
 
 // Conversion multipliers
-const IMU_ACCEL_MULT_4G: f32 = 1.196e-3; // 0.122e-3g/LSB -> 1.196e-3m/s^2/LSB
+const IMU_ACCEL_MULT_4G: f32 = 1.196e-3; // 0.122e-3g/LSB -> 1.196e-3m/s^2/LSB. Negative
+                                          // since the accleration read by the IMU is backwards.
 const IMU_RATE_MULT_250DPS: f32 = -1.527e-4; // 8.750e-3dps/LSB -> 1.527e-4 rad/s/LSB. Negative
                                              // since the rate is read counterclockwise while we
                                              // need our heading to be clockwise
 const IMU_TEMP_MULT: f32 = 3.906e-3; // 3.906e-3c/LSB
-const GRAVITY_MS2: f32 = 9.80665;
-const ZERO_THRESH: f32 = 0.1; // Threshold to zero a heading.Prevents gymbal lock at startup.
+const GRAVITY_MS2: f32 = 9.8066;
 
 // It only needs to be accurate enough down to 7.636e-5 radians.
 // Make the size equal to 2π/7.636e-5 aka 82284 (divided by 4, so 41142)
-const TRIG_TBL: [f32; 20571] = trig_table_gen_f32!(20571);
+pub static TRIG_TBL: [f32; 20571] = trig_table_gen_f32!(20571);
 
 /// Core 0 main function, the entrypoint for our code
 ///
@@ -269,7 +272,7 @@ fn main_0() -> ! {
     let mut commands_processed: u64 = 0;
     let mut loop_duration_us: u32 = 0; // Duration of the previous execution loop in us
     let mut data_left: usize = 0;
-    let mut out_data: [u32; 22] = [0; 22];
+    let mut out_data: [u32; 16] = [0; 16];
 
     // Tell core 1 we are ready for data!
     sio.fifo.write_blocking(SIO_CMD_READY);
@@ -292,15 +295,15 @@ fn main_0() -> ! {
                     let position_x_m = sio.fifo.read_blocking();
                     let position_y_m = sio.fifo.read_blocking();
                     let position_z_m = sio.fifo.read_blocking();
-                    let heading_x_r = sio.fifo.read_blocking();
-                    let heading_y_r = sio.fifo.read_blocking();
-                    let heading_z_r = sio.fifo.read_blocking();
+                    // let heading_x_r = sio.fifo.read_blocking();
+                    // let heading_y_r = sio.fifo.read_blocking();
+                    // let heading_z_r = sio.fifo.read_blocking();
                     let velocity_x_ms = sio.fifo.read_blocking();
                     let velocity_y_ms = sio.fifo.read_blocking();
                     let velocity_z_ms = sio.fifo.read_blocking();
-                    let rate_x_rs = sio.fifo.read_blocking();
-                    let rate_y_rs = sio.fifo.read_blocking();
-                    let rate_z_rs = sio.fifo.read_blocking();
+                    // let rate_x_rs = sio.fifo.read_blocking();
+                    // let rate_y_rs = sio.fifo.read_blocking();
+                    // let rate_z_rs = sio.fifo.read_blocking();
                     let imu_accel_x_ms2 = sio.fifo.read_blocking();
                     let imu_accel_y_ms2 = sio.fifo.read_blocking();
                     let imu_accel_z_ms2 = sio.fifo.read_blocking();
@@ -316,15 +319,15 @@ fn main_0() -> ! {
                         position_x_m,
                         position_y_m,
                         position_z_m,
-                        heading_x_r,
-                        heading_y_r,
-                        heading_z_r,
+                        // heading_x_r,
+                        // heading_y_r,
+                        // heading_z_r,
                         velocity_x_ms,
                         velocity_y_ms,
                         velocity_z_ms,
-                        rate_x_rs,
-                        rate_y_rs,
-                        rate_z_rs,
+                        // rate_x_rs,
+                        // rate_y_rs,
+                        // rate_z_rs,
                         imu_accel_x_ms2,
                         imu_accel_y_ms2,
                         imu_accel_z_ms2,
@@ -333,7 +336,7 @@ fn main_0() -> ! {
                         acceleration_z_ms2,
                     ];
 
-                    data_left = (22 * 4) - log_file.write(&bytes_of(&out_data)).unwrap();
+                    data_left = (16 * 4) - log_file.write(&bytes_of(&out_data)).unwrap();
                 }
                 _ => {
                     panic!("Invalid response from core 1!");
@@ -342,7 +345,7 @@ fn main_0() -> ! {
         } else {
             data_left = data_left
                 - log_file
-                    .write(&bytes_of(&out_data)[(22 * 4) - data_left..])
+                    .write(&bytes_of(&out_data)[(16 * 4) - data_left..])
                     .unwrap();
         }
 
@@ -387,7 +390,6 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
     let mut sio = hal::Sio::new(pac.SIO);
 
     let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS);
-    let trig = TrigTableF32::new(&TRIG_TBL);
     let mut alarm_3 = timer.alarm_3().unwrap();
 
     // Check the IMU
@@ -418,6 +420,7 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
     const SAMPLE_COUNT: usize = 1000;
     for _ in 0..SAMPLE_COUNT {
         // Schedule the alarm
+        // !TODO! for some reason the processor hangs if the alarm is set, figure out why...
         //alarm_3.schedule(MicrosDurationU32::micros(1000)).unwrap();
 
         // Gather telemetry
@@ -446,50 +449,19 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
         //while !alarm_3.finished() {}
     }
 
-    // Calculate the heading
+    
+    // Get the individual unit quaternions associated with each axis
+    let imu_accel_ms2 = Vector3::new(imu_accel_x_ms2, imu_accel_y_ms2, imu_accel_z_ms2);
+    let (mut x_unit, mut y_unit, mut z_unit) = initial_unit_quaternions(imu_accel_ms2);
 
-    // For the X axis, Y is the opposite and Z is the adjacent
-    let mut heading_x_r: f32 = atan2f(imu_accel_y_ms2, imu_accel_z_ms2);
+    let gravity = Vector3::new(0.0, 0.0, -GRAVITY_MS2);
+    let cal_mult = GRAVITY_MS2 / imu_accel_ms2.magnitude();
 
-    // For the Y axis, X is the -opposite and Z is the adjacent
-    let mut heading_y_r: f32 = atan2f(-imu_accel_x_ms2, imu_accel_z_ms2);
+    let mut x_vec_ms2 = Vector3::from(x_unit.vector()) * imu_accel_x_ms2 * cal_mult;
+    let mut y_vec_ms2 = Vector3::from(y_unit.vector()) * imu_accel_y_ms2 * cal_mult;
+    let mut z_vec_ms2 = Vector3::from(z_unit.vector()) * imu_accel_z_ms2 * cal_mult;
 
-    // For the Z axis, X is the opposite and Y is the adjacent
-    let mut heading_z_r: f32 = atan2f(imu_accel_x_ms2, imu_accel_y_ms2);
-
-    // !TODO! all euler math past this point it to be replaced, keep in mind!
-    // Correct the initial accelerations
-    // Negate heading
-    let sin_x = trig.sin(-heading_x_r);
-    let sin_y = trig.sin(-heading_y_r);
-    let sin_z = trig.sin(-heading_z_r);
-
-    let cos_x = trig.cos(-heading_x_r);
-    let cos_y = trig.cos(-heading_y_r);
-    let cos_z = trig.cos(-heading_z_r);
-
-    // Acceleration across the X is affected by Y and Z heading
-    let mut acceleration_x_ms2 =
-        sin_y * imu_accel_z_ms2 + cos_y * (cos_z * imu_accel_x_ms2 - sin_z * imu_accel_y_ms2);
-
-    // Acceleration across the Y is affected by X and Z heading
-    let mut acceleration_y_ms2 =
-        sin_z * imu_accel_x_ms2 + cos_z * (cos_x * imu_accel_y_ms2 - sin_x * imu_accel_z_ms2);
-
-    // Acceleration across the Z is affected by X and Y heading
-    let mut acceleration_z_ms2 =
-        sin_x * imu_accel_y_ms2 + cos_x * (cos_y * imu_accel_z_ms2 - sin_y * imu_accel_x_ms2);
-
-    // Calibrate to gravity
-    let accel_adjust = GRAVITY_MS2 / acceleration_z_ms2;
-
-    // Multiply all accelerations by accel adjust
-    acceleration_x_ms2 *= accel_adjust;
-    acceleration_y_ms2 *= accel_adjust;
-    acceleration_z_ms2 *= accel_adjust;
-
-    // Subtract gravity from the Z acceleration
-    acceleration_z_ms2 -= GRAVITY_MS2;
+    let mut acceleration_ms2 = x_vec_ms2 + y_vec_ms2 + z_vec_ms2 + gravity;
 
     // ===================================================================== //
     // EXECUTION LOOP                                                        //
@@ -502,15 +474,8 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
     let mut loop_duration_us: u32 = 0; // Duration of the previous execution loop in us
     let mut time: f32 = 0.0; // Time in seconds
     let mut temperature_imu_c: f32 = 0.0; // Temperature of IMU in C
-    let mut position_x_m: f32 = 0.0; // Position in the X plane, in meters
-    let mut position_y_m: f32 = 0.0; // Position in the Y plane, in meters
-    let mut position_z_m: f32 = 0.0; // Position in the Z plane, in meters
-    let mut velocity_x_ms: f32 = 0.0; // Velocity in the X plane, in m/s
-    let mut velocity_y_ms: f32 = 0.0; // Velocity in the Y plane, in m/s
-    let mut velocity_z_ms: f32 = 0.0; // Velocity in the Z plane, in m/s
-    let mut rate_x_rs: f32 = 0.0; // Angular rate along the X axis in r/s
-    let mut rate_y_rs: f32 = 0.0; // Angular rate along the Y axis in r/s
-    let mut rate_z_rs: f32 = 0.0; // Angular rate along the Z axis in r/s
+    let mut position_m = Vector3::new(0.0, 0.0, 0.0); // Position in the X plane, in meters
+    let mut velocity_ms = Vector3::new(0.0, 0.0, 0.0); // Velocity in the X plane, in m/s
 
     // Math variables
     // With the default 4g range we have a sensitivity of 0.122 mg/LSB which
@@ -535,6 +500,16 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
         if let Some(cmd) = sio.fifo.read() {
             match cmd {
                 SIO_CMD_READY => {
+                    let position_x_m: f32 = position_m.x;
+                    let position_y_m: f32 = position_m.y;
+                    let position_z_m: f32 = position_m.z;
+                    let velocity_x_ms:f32 = velocity_ms.x;
+                    let velocity_y_ms:f32 = velocity_ms.y;
+                    let velocity_z_ms:f32 = velocity_ms.z;
+                    let acceleration_x_ms2:f32 = acceleration_ms2.x;
+                    let acceleration_y_ms2:f32 = acceleration_ms2.y;
+                    let acceleration_z_ms2:f32 = acceleration_ms2.z;
+
                     sio.fifo.write_blocking(SIO_CMD_TELEM);
                     sio.fifo.write_blocking(loop_duration_us);
                     sio.fifo
@@ -547,24 +522,24 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
                         .write_blocking(u32::from_ne_bytes(position_y_m.to_ne_bytes()));
                     sio.fifo
                         .write_blocking(u32::from_ne_bytes(position_z_m.to_ne_bytes()));
-                    sio.fifo
-                        .write_blocking(u32::from_ne_bytes(heading_x_r.to_ne_bytes()));
-                    sio.fifo
-                        .write_blocking(u32::from_ne_bytes(heading_y_r.to_ne_bytes()));
-                    sio.fifo
-                        .write_blocking(u32::from_ne_bytes(heading_z_r.to_ne_bytes()));
+                    // sio.fifo
+                    //     .write_blocking(u32::from_ne_bytes(heading_x_r.to_ne_bytes()));
+                    // sio.fifo
+                    //     .write_blocking(u32::from_ne_bytes(heading_y_r.to_ne_bytes()));
+                    // sio.fifo
+                    //     .write_blocking(u32::from_ne_bytes(heading_z_r.to_ne_bytes()));
                     sio.fifo
                         .write_blocking(u32::from_ne_bytes(velocity_x_ms.to_ne_bytes()));
                     sio.fifo
                         .write_blocking(u32::from_ne_bytes(velocity_y_ms.to_ne_bytes()));
                     sio.fifo
                         .write_blocking(u32::from_ne_bytes(velocity_z_ms.to_ne_bytes()));
-                    sio.fifo
-                        .write_blocking(u32::from_ne_bytes(rate_x_rs.to_ne_bytes()));
-                    sio.fifo
-                        .write_blocking(u32::from_ne_bytes(rate_y_rs.to_ne_bytes()));
-                    sio.fifo
-                        .write_blocking(u32::from_ne_bytes(rate_z_rs.to_ne_bytes()));
+                    // sio.fifo
+                    //     .write_blocking(u32::from_ne_bytes(rate_x_rs.to_ne_bytes()));
+                    // sio.fifo
+                    //     .write_blocking(u32::from_ne_bytes(rate_y_rs.to_ne_bytes()));
+                    // sio.fifo
+                    //     .write_blocking(u32::from_ne_bytes(rate_z_rs.to_ne_bytes()));
                     sio.fifo
                         .write_blocking(u32::from_ne_bytes(imu_accel_x_ms2.to_ne_bytes()));
                     sio.fifo
@@ -616,9 +591,10 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
 
         temperature_imu_c = (temperature_imu_raw as f32) * IMU_TEMP_MULT;
 
-        rate_x_rs = (rate_x_raw as f32) * rate_multiplier;
-        rate_y_rs = (rate_y_raw as f32) * rate_multiplier;
-        rate_z_rs = (rate_z_raw as f32) * rate_multiplier;
+        // Angular rates are clockwise
+        let rate_x_rs = (rate_x_raw as f32) * rate_multiplier;
+        let rate_y_rs = (rate_y_raw as f32) * rate_multiplier;
+        let rate_z_rs = (rate_z_raw as f32) * rate_multiplier;
 
         imu_accel_x_ms2 = (imu_accel_x_raw as f32) * imu_accel_multiplier;
         imu_accel_y_ms2 = (imu_accel_y_raw as f32) * imu_accel_multiplier;
@@ -627,54 +603,29 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
         // Compute everyting else
         let time_delta = time - prev_time;
 
+        // Remember, rotations are clockwise here.
+        // No stinky counterclockwise rotations!
         let heading_delta_x_r = rate_x_rs * time_delta;
         let heading_delta_y_r = rate_y_rs * time_delta;
         let heading_delta_z_r = rate_z_rs * time_delta;
 
-        heading_x_r += heading_delta_x_r;
-        heading_y_r += heading_delta_y_r;
-        heading_z_r += heading_delta_z_r;
+        let rotation_quaternion = multi_rotate(heading_delta_x_r, heading_delta_y_r, heading_delta_z_r);
 
-        // Rotate all the accelerations to match the coordinate system's axies
-        let sin_x = trig.sin(-heading_x_r);
-        let sin_y = trig.sin(-heading_y_r);
-        let sin_z = trig.sin(-heading_z_r);
+        // Rotate the unit quaternions by the rotation quaternion
+        
+        x_unit = rotation_quaternion.inverse() * x_unit * rotation_quaternion;
+        y_unit = rotation_quaternion.inverse() * y_unit * rotation_quaternion;
+        z_unit = rotation_quaternion.inverse() * z_unit * rotation_quaternion;
 
-        let cos_x = trig.cos(-heading_x_r);
-        let cos_y = trig.cos(-heading_y_r);
-        let cos_z = trig.cos(-heading_z_r);
+        x_vec_ms2 = Vector3::from(x_unit.vector()) * imu_accel_x_ms2 * cal_mult;
+        y_vec_ms2 = Vector3::from(y_unit.vector()) * imu_accel_y_ms2 * cal_mult;
+        z_vec_ms2 = Vector3::from(z_unit.vector()) * imu_accel_z_ms2 * cal_mult;         
+                                                                                         
+        acceleration_ms2 = x_vec_ms2 + y_vec_ms2 + z_vec_ms2 + gravity;
 
-        // Acceleration across the X is affected by Y and Z heading
-        acceleration_x_ms2 =
-            sin_y * imu_accel_z_ms2 + cos_y * (cos_z * imu_accel_x_ms2 - sin_z * imu_accel_y_ms2);
+        position_m += velocity_ms * time_delta + acceleration_ms2 * (time_delta * time_delta * 0.5);
 
-        // Acceleration across the Y is affected by X and Z heading
-        acceleration_y_ms2 =
-            sin_z * imu_accel_x_ms2 + cos_z * (cos_x * imu_accel_y_ms2 - sin_x * imu_accel_z_ms2);
-
-        // Acceleration across the Z is affected by X and Y heading
-        acceleration_z_ms2 =
-            sin_x * imu_accel_y_ms2 + cos_x * (cos_y * imu_accel_z_ms2 - sin_y * imu_accel_x_ms2);
-
-        // Multiply all accelerations by accel adjust
-        acceleration_x_ms2 *= accel_adjust;
-        acceleration_y_ms2 *= accel_adjust;
-        acceleration_z_ms2 *= accel_adjust;
-
-        // Subtract gravity from the Z acceleration
-        acceleration_z_ms2 -= GRAVITY_MS2;
-
-        // Calculate new coordinates given accelerations
-        // D = vt + 0.5at^2
-        let time_delta_sqrd_hlvd = time_delta * time_delta * 0.5;
-        position_x_m += velocity_x_ms * time_delta + acceleration_x_ms2 * time_delta_sqrd_hlvd;
-        position_y_m += velocity_y_ms * time_delta + acceleration_y_ms2 * time_delta_sqrd_hlvd;
-        position_z_m += velocity_z_ms * time_delta + acceleration_z_ms2 * time_delta_sqrd_hlvd;
-
-        // Calculate new velocity given accelerations
-        velocity_x_ms += acceleration_x_ms2 * time_delta;
-        velocity_y_ms += acceleration_y_ms2 * time_delta;
-        velocity_z_ms += acceleration_z_ms2 * time_delta;
+        velocity_ms += acceleration_ms2 * time_delta;
 
         // Store the loop time to the previous time variable
         loop_duration_us = timer
