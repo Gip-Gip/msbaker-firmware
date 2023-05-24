@@ -35,20 +35,17 @@ use nalgebra::Vector3;
 use pac::I2C1;
 use rp_sdio::sdio::Sdio4bit;
 
-use ape_mbr::{Partition, PartitionId, MBR};
+use ape_mbr::{PartitionId, MBR};
 use rp2040_hal as hal;
 
 use core::panic::PanicInfo;
 use core::str::FromStr;
 use hal::{pac, Timer, I2C};
 
-use hal::dma::{Channel, DMAExt, CH0};
+use hal::dma::DMAExt;
 
 use embedded_hal::blocking::i2c::WriteRead;
-use fugit::{
-    MicrosDuration, MicrosDurationU32, MicrosDurationU64, RateExtU32, SecsDurationU64,
-    TimerInstantU64,
-};
+use fugit::{MicrosDurationU32, RateExtU32, TimerInstantU64};
 use hal::pio::PIOExt;
 
 use cortex_m::delay::Delay;
@@ -94,16 +91,12 @@ const IMU_ACCEL_REG: u8 = 0x28;
 
 // Conversion multipliers
 const IMU_ACCEL_MULT_4G: f32 = 1.196e-3; // 0.122e-3g/LSB -> 1.196e-3m/s^2/LSB. Negative
-                                          // since the accleration read by the IMU is backwards.
+                                         // since the accleration read by the IMU is backwards.
 const IMU_RATE_MULT_250DPS: f32 = -1.527e-4; // 8.750e-3dps/LSB -> 1.527e-4 rad/s/LSB. Negative
                                              // since the rate is read counterclockwise while we
                                              // need our heading to be clockwise
 const IMU_TEMP_MULT: f32 = 3.906e-3; // 3.906e-3c/LSB
 const GRAVITY_MS2: f32 = 9.8066;
-
-// It only needs to be accurate enough down to 7.636e-5 radians.
-// Make the size equal to 2π/7.636e-5 aka 82284 (divided by 4, so 41142)
-pub static TRIG_TBL: [f32; 20571] = trig_table_gen_f32!(20571);
 
 /// Core 0 main function, the entrypoint for our code
 ///
@@ -272,7 +265,7 @@ fn main_0() -> ! {
     let mut commands_processed: u64 = 0;
     let mut loop_duration_us: u32 = 0; // Duration of the previous execution loop in us
     let mut data_left: usize = 0;
-    let mut out_data: [u32; 16] = [0; 16];
+    let mut out_data: [u32; 19] = [0; 19];
 
     // Tell core 1 we are ready for data!
     sio.fifo.write_blocking(SIO_CMD_READY);
@@ -295,9 +288,9 @@ fn main_0() -> ! {
                     let position_x_m = sio.fifo.read_blocking();
                     let position_y_m = sio.fifo.read_blocking();
                     let position_z_m = sio.fifo.read_blocking();
-                    // let heading_x_r = sio.fifo.read_blocking();
-                    // let heading_y_r = sio.fifo.read_blocking();
-                    // let heading_z_r = sio.fifo.read_blocking();
+                    let heading_x_r = sio.fifo.read_blocking();
+                    let heading_y_r = sio.fifo.read_blocking();
+                    let heading_z_r = sio.fifo.read_blocking();
                     let velocity_x_ms = sio.fifo.read_blocking();
                     let velocity_y_ms = sio.fifo.read_blocking();
                     let velocity_z_ms = sio.fifo.read_blocking();
@@ -319,9 +312,9 @@ fn main_0() -> ! {
                         position_x_m,
                         position_y_m,
                         position_z_m,
-                        // heading_x_r,
-                        // heading_y_r,
-                        // heading_z_r,
+                        heading_x_r,
+                        heading_y_r,
+                        heading_z_r,
                         velocity_x_ms,
                         velocity_y_ms,
                         velocity_z_ms,
@@ -336,7 +329,7 @@ fn main_0() -> ! {
                         acceleration_z_ms2,
                     ];
 
-                    data_left = (16 * 4) - log_file.write(&bytes_of(&out_data)).unwrap();
+                    data_left = (19 * 4) - log_file.write(&bytes_of(&out_data)).unwrap();
                 }
                 _ => {
                     panic!("Invalid response from core 1!");
@@ -345,7 +338,7 @@ fn main_0() -> ! {
         } else {
             data_left = data_left
                 - log_file
-                    .write(&bytes_of(&out_data)[(16 * 4) - data_left..])
+                    .write(&bytes_of(&out_data)[(19 * 4) - data_left..])
                     .unwrap();
         }
 
@@ -449,7 +442,6 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
         //while !alarm_3.finished() {}
     }
 
-    
     // Get the individual unit quaternions associated with each axis
     let imu_accel_ms2 = Vector3::new(imu_accel_x_ms2, imu_accel_y_ms2, imu_accel_z_ms2);
     let (mut x_unit, mut y_unit, mut z_unit) = initial_unit_quaternions(imu_accel_ms2);
@@ -457,9 +449,9 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
     let gravity = Vector3::new(0.0, 0.0, -GRAVITY_MS2);
     let cal_mult = GRAVITY_MS2 / imu_accel_ms2.magnitude();
 
-    let mut x_vec_ms2 = Vector3::from(x_unit.vector()) * imu_accel_x_ms2 * cal_mult;
-    let mut y_vec_ms2 = Vector3::from(y_unit.vector()) * imu_accel_y_ms2 * cal_mult;
-    let mut z_vec_ms2 = Vector3::from(z_unit.vector()) * imu_accel_z_ms2 * cal_mult;
+    let mut x_vec_ms2 = Vector3::from(x_unit.vector()) * (imu_accel_x_ms2 * cal_mult);
+    let mut y_vec_ms2 = Vector3::from(y_unit.vector()) * (imu_accel_y_ms2 * cal_mult);
+    let mut z_vec_ms2 = Vector3::from(z_unit.vector()) * (imu_accel_z_ms2 * cal_mult);
 
     let mut acceleration_ms2 = x_vec_ms2 + y_vec_ms2 + z_vec_ms2 + gravity;
 
@@ -476,6 +468,9 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
     let mut temperature_imu_c: f32 = 0.0; // Temperature of IMU in C
     let mut position_m = Vector3::new(0.0, 0.0, 0.0); // Position in the X plane, in meters
     let mut velocity_ms = Vector3::new(0.0, 0.0, 0.0); // Velocity in the X plane, in m/s
+    let mut heading_x_r: f32 = 0.0;
+    let mut heading_y_r: f32 = 0.0;
+    let mut heading_z_r: f32 = 0.0;
 
     // Math variables
     // With the default 4g range we have a sensitivity of 0.122 mg/LSB which
@@ -503,12 +498,12 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
                     let position_x_m: f32 = position_m.x;
                     let position_y_m: f32 = position_m.y;
                     let position_z_m: f32 = position_m.z;
-                    let velocity_x_ms:f32 = velocity_ms.x;
-                    let velocity_y_ms:f32 = velocity_ms.y;
-                    let velocity_z_ms:f32 = velocity_ms.z;
-                    let acceleration_x_ms2:f32 = acceleration_ms2.x;
-                    let acceleration_y_ms2:f32 = acceleration_ms2.y;
-                    let acceleration_z_ms2:f32 = acceleration_ms2.z;
+                    let velocity_x_ms: f32 = velocity_ms.x;
+                    let velocity_y_ms: f32 = velocity_ms.y;
+                    let velocity_z_ms: f32 = velocity_ms.z;
+                    let acceleration_x_ms2: f32 = acceleration_ms2.x;
+                    let acceleration_y_ms2: f32 = acceleration_ms2.y;
+                    let acceleration_z_ms2: f32 = acceleration_ms2.z;
 
                     sio.fifo.write_blocking(SIO_CMD_TELEM);
                     sio.fifo.write_blocking(loop_duration_us);
@@ -522,12 +517,12 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
                         .write_blocking(u32::from_ne_bytes(position_y_m.to_ne_bytes()));
                     sio.fifo
                         .write_blocking(u32::from_ne_bytes(position_z_m.to_ne_bytes()));
-                    // sio.fifo
-                    //     .write_blocking(u32::from_ne_bytes(heading_x_r.to_ne_bytes()));
-                    // sio.fifo
-                    //     .write_blocking(u32::from_ne_bytes(heading_y_r.to_ne_bytes()));
-                    // sio.fifo
-                    //     .write_blocking(u32::from_ne_bytes(heading_z_r.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(heading_x_r.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(heading_y_r.to_ne_bytes()));
+                    sio.fifo
+                        .write_blocking(u32::from_ne_bytes(heading_z_r.to_ne_bytes()));
                     sio.fifo
                         .write_blocking(u32::from_ne_bytes(velocity_x_ms.to_ne_bytes()));
                     sio.fifo
@@ -609,18 +604,29 @@ fn main_1(mut i2c1: I2C<I2C1, (Pin<Gpio6, FunctionI2C>, Pin<Gpio7, FunctionI2C>)
         let heading_delta_y_r = rate_y_rs * time_delta;
         let heading_delta_z_r = rate_z_rs * time_delta;
 
-        let rotation_quaternion = multi_rotate(heading_delta_x_r, heading_delta_y_r, heading_delta_z_r);
+        heading_x_r += heading_delta_x_r;
+        heading_y_r += heading_delta_y_r;
+        heading_z_r += heading_delta_z_r;
+
+        let rotation_quaternion = multi_rotate(
+            heading_delta_x_r,
+            heading_delta_y_r,
+            heading_delta_z_r,
+            x_unit,
+            y_unit,
+            z_unit,
+        );
 
         // Rotate the unit quaternions by the rotation quaternion
-        
+
         x_unit = rotation_quaternion.inverse() * x_unit * rotation_quaternion;
         y_unit = rotation_quaternion.inverse() * y_unit * rotation_quaternion;
         z_unit = rotation_quaternion.inverse() * z_unit * rotation_quaternion;
 
-        x_vec_ms2 = Vector3::from(x_unit.vector()) * imu_accel_x_ms2 * cal_mult;
-        y_vec_ms2 = Vector3::from(y_unit.vector()) * imu_accel_y_ms2 * cal_mult;
-        z_vec_ms2 = Vector3::from(z_unit.vector()) * imu_accel_z_ms2 * cal_mult;         
-                                                                                         
+        x_vec_ms2 = Vector3::from(x_unit.vector()) * (imu_accel_x_ms2 * cal_mult);
+        y_vec_ms2 = Vector3::from(y_unit.vector()) * (imu_accel_y_ms2 * cal_mult);
+        z_vec_ms2 = Vector3::from(z_unit.vector()) * (imu_accel_z_ms2 * cal_mult);
+
         acceleration_ms2 = x_vec_ms2 + y_vec_ms2 + z_vec_ms2 + gravity;
 
         position_m += velocity_ms * time_delta + acceleration_ms2 * (time_delta * time_delta * 0.5);
